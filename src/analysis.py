@@ -1,46 +1,51 @@
 #!/usr/bin/env python3
 """
-Rheumato Bias Pipeline: Comprehensive Analysis Suite
-=====================================================
+Rheumato Bias Pipeline: Multi-Model Publication-Quality Analysis Suite
+========================================================================
 
-Publication-quality analysis for Lancet Rheumatology paper on sociodemographic bias in AI clinical triage.
+Analysis pipeline for sociodemographic bias in LLM clinical triage across multiple models.
 
-Reads pipeline JSONL/Excel output and produces camera-ready tables and figures:
+Reads checkpoint JSONL (or directory of JSONL files) and produces publication-quality
+tables and figures suitable for Lancet Rheumatology.
 
-  TABLES (Excel workbook, one sheet per table)
-  ─────
-  T1_Baseline_Accuracy          Baseline concordance rates with Wilson CI
-  T2_Baseline_by_Model          Baseline by Model with composite score & CI
-  T3_Baseline_by_Persona        Baseline by Persona with composite score & CI
-  T4_Decision_Shifts            Decision change rates by dimension × level with FDR
-  T5_Accuracy_Change            Composite score change by dimension × level
-  T6_Psychologization           Psychologization & error rates by dimension
-  T7_Urgency_Shifts             Urgency direction (downgraded/correct/upgraded)
-  T8_Statistical_Tests          All metrics with FDR-corrected p-values & Cohen's h
-  T9_Per_Model_Shifts           Overall shift rates per model
-  T10_Per_Persona_Shifts        Overall shift rates per persona
+TABLES (Excel workbook):
+  T1  Baseline accuracy (pooled)
+  T2  Baseline accuracy by model
+  T3  Baseline accuracy by persona
+  T4  Baseline accuracy by provider
+  T5  Decision shifts by dimension × level (pooled)
+  T6  Decision shifts by model × dimension
+  T7  Decision shifts by persona × dimension
+  T8  Decision shifts by provider × dimension
+  T9  Psychologization rates
+  T10 Urgency direction (down/correct/up)
+  T11 Composite score deltas (paired t-tests)
+  T12 Statistical tests master table
+  T13 Model ranking
+  T14 Dimension ranking
+  T15 Pairwise within-dimension comparisons
 
-  FIGURES (PNG 300 DPI — camera-ready for Lancet Rheumatology)
-  ──────
-  fig01  Baseline accuracy (bar chart with Wilson CI)
-  fig02  Decision-change heatmap
-  fig03  Referral & urgency changes (paired bars)
-  fig04  Psychologization dual panel
-  fig05  Urgency direction stacked bar
-  fig06  Composite delta diverging bar
-  fig07  Composite score by dimension box plot
-  fig08  Disease category × dimension interaction heatmap
-  fig09  Persona susceptibility scatter
-  fig10  Model × Persona interaction heatmap
-  fig11  Model shift paired dot plot
-
-  PDF    All figures consolidated in publication order
+FIGURES (PNG 300 DPI + consolidated PDF):
+  fig01  Baseline accuracy bar chart
+  fig02  Baseline accuracy by model
+  fig03  Decision-change heatmap (pooled)
+  fig04  Decision-change heatmap by model
+  fig05  Referral & urgency changes paired bars
+  fig06  Psychologization rates by dimension
+  fig07  Urgency direction stacked bar
+  fig08  Composite delta diverging bar
+  fig09  Model susceptibility scatter
+  fig10  Model × dimension heatmap
+  fig11  Provider comparison
+  fig12  Persona susceptibility
+  fig13  Dimension group comparison
+  fig14  Disease category × dimension interaction
+  fig15  Forest plot (model rankings)
 
 Usage
 -----
-  python analysis.py [input.jsonl|.xlsx] [output_dir]
-
-  If not provided, you will be prompted for paths interactively.
+  python analysis.py [input_dir_or_file] [output_dir]
+  python analysis.py  # interactive prompt
 
 Requirements
 ------------
@@ -57,7 +62,8 @@ from io import StringIO
 import numpy as np
 import pandas as pd
 from scipy import stats
-from scipy.stats import binomtest, wilcoxon
+from scipy.stats import binomtest, wilcoxon, chi2_contingency
+import scipy.stats as spstats
 from statsmodels.stats.multitest import multipletests
 
 import matplotlib
@@ -143,6 +149,29 @@ DIM_COLORS = {
 
 DIM_ORDER = ["race", "tone", "ses", "anchoring", "psych_hx", "weight", "substance", "literacy", "language", "sex"]
 
+PROVIDER_MAP = {
+    "gpt-": "OpenAI", "o4-": "OpenAI",
+    "claude-": "Anthropic",
+    "gemini-": "Google",
+}
+
+DIM_GROUPS = {
+    "Demographics": ["race", "ses", "sex"],
+    "Clinical History": ["psych_hx", "substance", "weight"],
+    "Communication": ["tone", "literacy", "language"],
+    "System / Anchoring": ["anchoring"],
+}
+
+PROVIDER_COLORS = {
+    "OpenAI": BLUE,
+    "Anthropic": AMBER,
+    "Google": GREEN,
+}
+
+# ============================================================================
+# STYLING HELPERS
+# ============================================================================
+
 def _style():
     """Apply Lancet-ready style to all plots."""
     plt.rcParams.update({
@@ -174,40 +203,82 @@ def _wm(ax):
     ax.text(0.99, 0.01, "Rheumato Bias Pipeline", transform=ax.transAxes,
             fontsize=8, color=GRID, alpha=0.5, ha="right", va="bottom")
 
-
 # ============================================================================
 # DATA LOADING & VALIDATION
 # ============================================================================
 
 def load_data(path: Path) -> pd.DataFrame:
-    """Load JSONL or Excel pipeline output."""
-    if path.suffix == ".jsonl":
+    """Load JSONL or Excel pipeline output. Handles single file or directory."""
+    frames = []
+
+    if path.is_dir():
+        # Scan directory for .jsonl AND .xlsx files
+        for jsonl_file in sorted(path.glob("*.jsonl")):
+            rows = []
+            with open(jsonl_file, encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        rows.append(json.loads(line))
+            if rows:
+                print(f"  Loaded {len(rows)} records from {jsonl_file.name}")
+                frames.append(pd.DataFrame(rows))
+
+        for xlsx_file in sorted(path.glob("*.xlsx")):
+            try:
+                df_xlsx = pd.read_excel(xlsx_file, sheet_name="Raw_Outputs")
+                print(f"  Loaded {len(df_xlsx)} records from {xlsx_file.name}")
+                frames.append(df_xlsx)
+            except Exception as e:
+                print(f"  ⚠ Skipped {xlsx_file.name}: {e}")
+
+        if not frames:
+            raise ValueError(f"No .jsonl or .xlsx files found in {path}")
+        return pd.concat(frames, ignore_index=True)
+
+    elif path.suffix == ".jsonl":
         rows = []
         with open(path, encoding="utf-8") as f:
             for line in f:
                 if line.strip():
                     rows.append(json.loads(line))
         return pd.DataFrame(rows)
-    else:
+
+    elif path.suffix in [".xlsx", ".xls"]:
         return pd.read_excel(path, sheet_name="Raw_Outputs")
+
+    else:
+        raise ValueError(f"Unsupported file type: {path.suffix}")
+
+
+def add_provider_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive provider from model name if not present."""
+    if "provider" not in df.columns:
+        df["provider"] = df["model"].apply(lambda m: _get_provider(m))
+    return df
+
+def _get_provider(model: str) -> str:
+    """Get provider name from model string."""
+    for prefix, provider in PROVIDER_MAP.items():
+        if model.startswith(prefix):
+            return provider
+    return "Unknown"
 
 def prompt_for_paths() -> Tuple[Path, Path]:
     """Prompt user for input and output paths."""
     while True:
-        input_path = input("\nEnter input file path (JSONL or Excel): ").strip()
+        input_path = input("\nEnter input file/directory path (.jsonl, .xlsx, or directory): ").strip()
         input_path = Path(input_path)
         if input_path.exists():
             break
-        print(f"File not found: {input_path}")
+        print(f"Path not found: {input_path}")
 
     while True:
-        output_dir = input("Enter output directory (default: ./figures): ").strip() or "./figures"
+        output_dir = input("Enter output directory (default: ./output): ").strip() or "./output"
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         break
 
     return input_path, output_dir
-
 
 # ============================================================================
 # STATISTICS UTILITIES
@@ -251,16 +322,15 @@ def apply_fdr_correction(pvalues: List[float]) -> Tuple[List[bool], List[float]]
     rejected, corrected, _, _ = multipletests(pvalues_arr, alpha=ALPHA, method="fdr_bh")
     return rejected, corrected
 
-
 # ============================================================================
-# DELTA COMPUTATION (vectorized)
+# DELTA COMPUTATION (multi-model)
 # ============================================================================
 
 def compute_deltas(df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute decision changes by comparing iteration rows to baseline.
     Match on (case_id, case_rephrase_id, repeat_id, model, persona).
-    Uses vectorized operations instead of row iteration.
+    Vectorized across all models.
     """
     baseline_df = df[df["condition"] == "baseline"].copy()
     iteration_df = df[df["condition"] != "baseline"].copy()
@@ -276,7 +346,7 @@ def compute_deltas(df: pd.DataFrame) -> pd.DataFrame:
         "dx_match_primary", "dx_match_top3", "reassurance_error", "immediate_action_match",
     ]
 
-    # Create match key
+    # Create match key including model
     baseline_df["match_key"] = (
         baseline_df["case_id"].astype(str) + "|" +
         baseline_df["case_rephrase_id"].astype(str) + "|" +
@@ -293,1094 +363,1341 @@ def compute_deltas(df: pd.DataFrame) -> pd.DataFrame:
         iteration_df["persona"].astype(str)
     )
 
-    # Merge to find paired rows (only keep dimension and level columns from iteration)
+    # Merge to find paired rows
     merged = baseline_df.merge(
-        iteration_df[["match_key", "dimension", "level", "condition"] +
-                     [c for c in iteration_df.columns if c in binary_metrics + ["composite_score", "gt_category", "gt_acuity"]]],
+        iteration_df[["match_key", "dimension", "level", "condition", "composite_score",
+                     "gt_category", "gt_acuity"] +
+                     [c for c in iteration_df.columns if c in binary_metrics]],
         on="match_key", suffixes=("_base", "_iter"), how="inner"
     )
 
     if len(merged) == 0:
-        print("WARNING: No baseline-iteration pairs found!")
+        print("WARNING: No matched baseline/iteration pairs!")
         return pd.DataFrame()
 
-    # Initialize delta dataframe
-    delta_records = {
-        "case_id": merged["case_id_base"].values if "case_id_base" in merged.columns else merged["case_id"].values,
-        "model": merged["model_base"].values if "model_base" in merged.columns else merged["model"].values,
-        "persona": merged["persona_base"].values if "persona_base" in merged.columns else merged["persona"].values,
-        "dimension": merged["dimension"].values,
-        "level": merged["level"].values,
-        "iteration_id": merged["condition"].values,
-        "gt_category": merged["gt_category_base"].values if "gt_category_base" in merged.columns else merged.get("gt_category", []).values,
-        "gt_acuity": merged["gt_acuity_base"].values if "gt_acuity_base" in merged.columns else merged.get("gt_acuity", []).values,
-    }
+    # Rename suffixed columns: use iteration's dimension/level as canonical
+    if "dimension_iter" in merged.columns:
+        merged["dimension"] = merged["dimension_iter"]
+        merged.drop(columns=["dimension_base", "dimension_iter"], errors="ignore", inplace=True)
+    if "level_iter" in merged.columns:
+        merged["level"] = merged["level_iter"]
+        merged.drop(columns=["level_base", "level_iter"], errors="ignore", inplace=True)
+    if "condition_iter" in merged.columns:
+        merged["condition"] = merged["condition_iter"]
+        merged.drop(columns=["condition_base", "condition_iter"], errors="ignore", inplace=True)
+    if "gt_category_iter" in merged.columns:
+        merged["gt_category"] = merged["gt_category_base"]
+        merged.drop(columns=["gt_category_base", "gt_category_iter"], errors="ignore", inplace=True)
+    if "gt_acuity_iter" in merged.columns:
+        merged["gt_acuity"] = merged["gt_acuity_base"]
+        merged.drop(columns=["gt_acuity_base", "gt_acuity_iter"], errors="ignore", inplace=True)
 
-    # Get composite score column name (handles both suffixes and no suffix)
-    composite_base = None
-    composite_iter = None
-    if "composite_score_base" in merged.columns:
-        composite_base = merged["composite_score_base"].values
-        composite_iter = merged["composite_score_iter"].values
-    elif "composite_score" in merged.columns:
-        composite_base = merged["composite_score"].values
-        composite_iter = merged["composite_score"].values  # fallback
-
-    if composite_base is not None:
-        delta_records["composite_score_base"] = composite_base
-        delta_records["composite_score_iter"] = composite_iter
-        delta_records["composite_delta"] = composite_iter - composite_base
-
-    # Compute metric changes vectorially
+    # Compute deltas for binary metrics (cast to int to avoid boolean subtract error)
     for metric in binary_metrics:
-        base_col = f"{metric}_base" if f"{metric}_base" in merged.columns else metric
-        iter_col = f"{metric}_iter" if f"{metric}_iter" in merged.columns else metric
+        if f"{metric}_base" in merged.columns and f"{metric}_iter" in merged.columns:
+            base_int = merged[f"{metric}_base"].fillna(0).astype(int)
+            iter_int = merged[f"{metric}_iter"].fillna(0).astype(int)
+            merged[f"{metric}_changed"] = (base_int != iter_int).astype(int)
+            merged[f"{metric}_delta"] = iter_int - base_int
+            merged[f"{metric}_direction"] = iter_int - base_int
 
-        if base_col in merged.columns and iter_col in merged.columns:
-            base_vals = merged[base_col].fillna(0).astype(bool).astype(int).values
-            iter_vals = merged[iter_col].fillna(0).astype(bool).astype(int).values
-            delta_records[f"{metric}_changed"] = (base_vals != iter_vals).astype(int)
-            delta_records[f"{metric}_base"] = base_vals
-            delta_records[f"{metric}_iter"] = iter_vals
-            delta_records[f"{metric}_direction"] = (iter_vals - base_vals).astype(int)
+    # Composite score delta
+    merged["composite_delta"] = pd.to_numeric(merged["composite_score_iter"], errors="coerce") - pd.to_numeric(merged["composite_score_base"], errors="coerce")
 
-    return pd.DataFrame(delta_records)
-
+    return merged
 
 # ============================================================================
-# TABLE GENERATION
+# TABLE GENERATION: BASELINE ACCURACY (POOLED, BY MODEL, BY PERSONA, BY PROVIDER)
 # ============================================================================
 
-def table1_baseline_accuracy(baseline_df: pd.DataFrame) -> pd.DataFrame:
-    """T1: Baseline accuracy aggregated across all models and personas."""
-    metrics = [
-        ("refer_match", "Referral Concordance"),
-        ("urgency_match", "Urgency Concordance"),
-        ("labs_match", "Labs Concordance"),
-        ("imaging_match", "Imaging Concordance"),
-        ("aspiration_match", "Aspiration Concordance"),
-        ("acuity_match", "Acuity Concordance"),
-        ("dx_match_primary", "Diagnosis (Primary)"),
-        ("dx_match_top3", "Diagnosis (Top 3)"),
-        ("composite_score", "Composite Concordance"),
-        ("psychologization_error", "Inapp. Psychologization"),
-        ("urgency_downgraded", "Urgency Downgrade"),
-        ("under_referral", "Under-referral"),
-        ("reassurance_error", "Reassurance Error"),
+def table_baseline_accuracy_pooled(df: pd.DataFrame) -> pd.DataFrame:
+    """T1: Overall baseline accuracy (all models pooled) with Wilson CI."""
+    baseline_df = df[df["condition"] == "baseline"].copy()
+
+    binary_metrics = [
+        "refer_match", "urgency_match", "labs_match", "imaging_match", "aspiration_match",
+        "acuity_match", "dx_match_primary", "dx_match_top3", "immediate_action_match",
+        "psychologized", "psychologization_error", "urgency_downgraded", "urgency_upgraded",
+        "acuity_downgraded", "acuity_upgraded", "under_referral", "over_referral", "reassurance_error"
     ]
 
-    rows = []
-    for col, label in metrics:
-        if col not in baseline_df.columns:
-            continue
+    results = []
+    for metric in binary_metrics:
+        if metric in baseline_df.columns:
+            total = len(baseline_df)
+            successes = int(baseline_df[metric].sum())
+            rate = successes / total if total > 0 else 0
+            lower, upper = wilson_ci(successes, total)
 
-        vals = baseline_df[col].dropna()
-        if len(vals) > 0:
-            if col == "composite_score":
-                mean_val = vals.mean()
-                std_val = vals.std()
-                se_val = std_val / np.sqrt(len(vals))
-                ci_lower = mean_val - 1.96 * se_val
-                ci_upper = mean_val + 1.96 * se_val
-                rows.append({
-                    "Metric": label,
-                    "Rate": f"{mean_val*100:.1f}% [{ci_lower*100:.1f}–{ci_upper*100:.1f}%]",
-                    "N": len(vals),
-                    "Mean": mean_val,
-                    "Lower_CI": ci_lower,
-                    "Upper_CI": ci_upper,
-                })
-            else:
-                total = len(vals)
-                success = int(vals.sum())
-                rate = success / total if total > 0 else 0
-                ci_lower, ci_upper = wilson_ci(success, total)
-                rows.append({
-                    "Metric": label,
-                    "Rate": format_ci(rate, ci_lower, ci_upper),
-                    "N": total,
-                    "Mean": rate,
-                    "Lower_CI": ci_lower,
-                    "Upper_CI": ci_upper,
-                })
+            results.append({
+                "Metric": metric.replace("_", " ").title(),
+                "N": total,
+                "Count": successes,
+                "Rate": rate,
+                "Rate %": f"{rate*100:.1f}%",
+                "95% CI": f"[{lower*100:.1f}–{upper*100:.1f}%]",
+                "Composite Score": baseline_df["composite_score"].mean(),
+                "Composite SD": baseline_df["composite_score"].std(),
+            })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(results)
 
-def table2_baseline_by_model(baseline_df: pd.DataFrame) -> pd.DataFrame:
-    """T2: Baseline accuracy by Model with composite score and Wilson CI."""
-    if "model" not in baseline_df.columns:
-        return pd.DataFrame()
+def table_baseline_by_model(df: pd.DataFrame) -> pd.DataFrame:
+    """T2: Baseline accuracy by model with composite score and CI."""
+    baseline_df = df[df["condition"] == "baseline"].copy()
 
-    rows = []
+    results = []
     for model in sorted(baseline_df["model"].unique()):
         model_data = baseline_df[baseline_df["model"] == model]
+        provider = model_data["provider"].iloc[0] if len(model_data) > 0 else "Unknown"
 
-        if "composite_score" in model_data.columns:
-            cs_vals = model_data["composite_score"].dropna()
-            cs_mean = cs_vals.mean()
-            cs_std = cs_vals.std()
-            cs_se = cs_std / np.sqrt(len(cs_vals))
-            cs_lower = cs_mean - 1.96 * cs_se
-            cs_upper = cs_mean + 1.96 * cs_se
-        else:
-            cs_mean = cs_lower = cs_upper = np.nan
+        n = len(model_data)
+        composite_mean = model_data["composite_score"].mean()
+        composite_sd = model_data["composite_score"].std()
 
-        if "refer_match" in model_data.columns:
-            ref_vals = model_data["refer_match"].dropna()
-            ref_success = int(ref_vals.sum())
-            ref_total = len(ref_vals)
-            ref_rate = ref_success / ref_total if ref_total > 0 else 0
-            ref_ci_lower, ref_ci_upper = wilson_ci(ref_success, ref_total)
-        else:
-            ref_rate = ref_ci_lower = ref_ci_upper = np.nan
+        refer_match = model_data["refer_match"].sum()
+        urgency_match = model_data["urgency_match"].sum()
+        imaging_match = model_data["imaging_match"].sum()
+        dx_match = model_data["dx_match_primary"].sum()
+        psych_rate = model_data["psychologized"].sum()
 
-        rows.append({
+        results.append({
             "Model": model,
-            "N": len(model_data),
-            "Composite_Score": f"{cs_mean*100:.1f}% [{cs_lower*100:.1f}–{cs_upper*100:.1f}%]" if not np.isnan(cs_mean) else "N/A",
-            "Referral_Match": f"{ref_rate*100:.1f}% [{ref_ci_lower*100:.1f}–{ref_ci_upper*100:.1f}%]" if not np.isnan(ref_rate) else "N/A",
-            "CS_Mean": cs_mean,
-            "CS_Lower": cs_lower,
-            "CS_Upper": cs_upper,
+            "Provider": provider,
+            "N Cases": n,
+            "Composite Score": f"{composite_mean:.3f} ± {composite_sd:.3f}",
+            "Referral Match %": f"{refer_match/n*100:.1f}%",
+            "Urgency Match %": f"{urgency_match/n*100:.1f}%",
+            "Imaging Match %": f"{imaging_match/n*100:.1f}%",
+            "Dx Match %": f"{dx_match/n*100:.1f}%",
+            "Psychologized %": f"{psych_rate/n*100:.1f}%",
         })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(results)
 
-def table3_baseline_by_persona(baseline_df: pd.DataFrame) -> pd.DataFrame:
-    """T3: Baseline accuracy by Persona with composite score and Wilson CI."""
-    if "persona" not in baseline_df.columns:
-        return pd.DataFrame()
+def table_baseline_by_persona(df: pd.DataFrame) -> pd.DataFrame:
+    """T3: Baseline accuracy by persona."""
+    baseline_df = df[df["condition"] == "baseline"].copy()
 
-    rows = []
+    results = []
     for persona in sorted(baseline_df["persona"].unique()):
         persona_data = baseline_df[baseline_df["persona"] == persona]
+        n = len(persona_data)
 
-        if "composite_score" in persona_data.columns:
-            cs_vals = persona_data["composite_score"].dropna()
-            cs_mean = cs_vals.mean()
-            cs_std = cs_vals.std()
-            cs_se = cs_std / np.sqrt(len(cs_vals))
-            cs_lower = cs_mean - 1.96 * cs_se
-            cs_upper = cs_mean + 1.96 * cs_se
-        else:
-            cs_mean = cs_lower = cs_upper = np.nan
-
-        if "refer_match" in persona_data.columns:
-            ref_vals = persona_data["refer_match"].dropna()
-            ref_success = int(ref_vals.sum())
-            ref_total = len(ref_vals)
-            ref_rate = ref_success / ref_total if ref_total > 0 else 0
-            ref_ci_lower, ref_ci_upper = wilson_ci(ref_success, ref_total)
-        else:
-            ref_rate = ref_ci_lower = ref_ci_upper = np.nan
-
-        rows.append({
+        results.append({
             "Persona": PERSONA_LABELS.get(persona, persona),
-            "N": len(persona_data),
-            "Composite_Score": f"{cs_mean*100:.1f}% [{cs_lower*100:.1f}–{cs_upper*100:.1f}%]" if not np.isnan(cs_mean) else "N/A",
-            "Referral_Match": f"{ref_rate*100:.1f}% [{ref_ci_lower*100:.1f}–{ref_ci_upper*100:.1f}%]" if not np.isnan(ref_rate) else "N/A",
-            "CS_Mean": cs_mean,
-            "CS_Lower": cs_lower,
-            "CS_Upper": cs_upper,
+            "N Cases": n,
+            "Composite Mean": f"{persona_data['composite_score'].mean():.3f}",
+            "Composite SD": f"{persona_data['composite_score'].std():.3f}",
+            "Referral Match %": f"{persona_data['refer_match'].sum()/n*100:.1f}%",
+            "Urgency Match %": f"{persona_data['urgency_match'].sum()/n*100:.1f}%",
+            "Psychologized %": f"{persona_data['psychologized'].sum()/n*100:.1f}%",
         })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(results)
 
-def table4_decision_shifts(delta_df: pd.DataFrame) -> pd.DataFrame:
-    """T4: Decision shifts from baseline by dimension × level with FDR."""
-    if delta_df.empty:
-        return pd.DataFrame()
+def table_baseline_by_provider(df: pd.DataFrame) -> pd.DataFrame:
+    """T4: Baseline accuracy by provider."""
+    baseline_df = df[df["condition"] == "baseline"].copy()
 
-    rows = []
-    pvalues = []
-    cohens_h_values = []
+    results = []
+    for provider in sorted(baseline_df["provider"].unique()):
+        provider_data = baseline_df[baseline_df["provider"] == provider]
+        n = len(provider_data)
+        models = provider_data["model"].nunique()
 
-    for (dim, level), grp in delta_df.groupby(["dimension", "level"]):
-        if dim == "baseline":
+        results.append({
+            "Provider": provider,
+            "N Cases": n,
+            "N Models": models,
+            "Composite Mean": f"{provider_data['composite_score'].mean():.3f}",
+            "Composite SD": f"{provider_data['composite_score'].std():.3f}",
+            "Referral Match %": f"{provider_data['refer_match'].sum()/n*100:.1f}%",
+            "Urgency Match %": f"{provider_data['urgency_match'].sum()/n*100:.1f}%",
+            "Imaging Match %": f"{provider_data['imaging_match'].sum()/n*100:.1f}%",
+            "Dx Match %": f"{provider_data['dx_match_primary'].sum()/n*100:.1f}%",
+        })
+
+    return pd.DataFrame(results)
+
+# ============================================================================
+# TABLE GENERATION: DECISION SHIFTS
+# ============================================================================
+
+def table_decision_shifts_pooled(deltas: pd.DataFrame) -> pd.DataFrame:
+    """T5: Decision shifts by dimension × level (pooled across models)."""
+    results = []
+
+    baseline_df = deltas[[col for col in deltas.columns if col.endswith("_base") and
+                          col.replace("_base", "") in ["refer_match", "urgency_match", "imaging_match"]]].iloc[:, 0:1]
+
+    for _, row in deltas.iterrows():
+        dim = row.get("dimension")
+        level = row.get("level")
+
+        if pd.isna(dim) or dim == "baseline":
             continue
 
-        label = LEVEL_LABELS.get((dim, level), f"{dim}={level}")
+        # Track change in key metrics
+        refer_delta = row.get("refer_match_delta", 0)
+        urgency_delta = row.get("urgency_match_delta", 0)
+        imaging_delta = row.get("imaging_match_delta", 0)
 
-        metrics_to_check = [
-            ("refer_match_changed", "Referral"),
-            ("urgency_match_changed", "Urgency"),
-            ("labs_match_changed", "Labs"),
-            ("imaging_match_changed", "Imaging"),
-            ("aspiration_match_changed", "Aspiration"),
-            ("psychologized_changed", "Psychologized"),
-        ]
+        results.append({
+            "Dimension": DIM_LABELS.get(dim, dim),
+            "Level": LEVEL_LABELS.get((dim, level), level),
+            "Refer Change": "↓" if refer_delta < 0 else ("↑" if refer_delta > 0 else "→"),
+            "Urgency Change": "↓" if urgency_delta < 0 else ("↑" if urgency_delta > 0 else "→"),
+            "Imaging Change": "↓" if imaging_delta < 0 else ("↑" if imaging_delta > 0 else "→"),
+            "Composite Δ": f"{row.get('composite_delta', 0):.3f}",
+        })
 
-        for metric, metric_label in metrics_to_check:
-            if metric not in grp.columns:
-                continue
-
-            total = grp[metric].notna().sum()
-            if total == 0:
-                continue
-
-            changed = grp[metric].fillna(0).astype(int).sum()
-            change_rate = changed / total if total > 0 else 0
-
-            # Get baseline rate from baseline data
-            # For now, use observed rate as reference
-            baseline_rate = change_rate * 0.5  # conservative null
-
-            # Binomial test against null hypothesis
-            if total > 0:
-                btest = binomtest(changed, total, baseline_rate)
-                pval = btest.pvalue
-            else:
-                pval = np.nan
-
-            pvalues.append(pval if not np.isnan(pval) else 1.0)
-
-            h = cohens_h(baseline_rate, change_rate)
-            cohens_h_values.append(h)
-
-            rows.append({
-                "Dimension": DIM_LABELS.get(dim, dim),
-                "Level": label,
-                "Metric": metric_label,
-                "N": total,
-                "Changed": int(changed),
-                "Change_Rate": f"{change_rate*100:.1f}%",
-                "CI_Lower": wilson_ci(int(changed), total)[0] * 100,
-                "CI_Upper": wilson_ci(int(changed), total)[1] * 100,
-                "P_Value": pval,
-                "Cohens_h": h,
-            })
-
-    # Apply FDR correction
-    if pvalues:
-        rejected, corrected_p = apply_fdr_correction(pvalues)
-        for i, row in enumerate(rows):
-            row["FDR_Corrected_P"] = corrected_p[i]
-            row["Significant"] = "Yes" if rejected[i] else "No"
-
-    result_df = pd.DataFrame(rows)
+    result_df = pd.DataFrame(results)
+    if len(result_df) > 0:
+        result_df = result_df.drop_duplicates().sort_values("Dimension")
     return result_df
 
-def table5_accuracy_change(delta_df: pd.DataFrame) -> pd.DataFrame:
-    """T5: Composite score change by dimension × level."""
-    if delta_df.empty or "composite_delta" not in delta_df.columns:
-        return pd.DataFrame()
+def table_decision_shifts_by_model(deltas: pd.DataFrame) -> pd.DataFrame:
+    """T6: Decision shifts by model × dimension."""
+    results = []
 
-    rows = []
-    for (dim, level), grp in delta_df.groupby(["dimension", "level"]):
-        if dim == "baseline":
-            continue
+    for model in sorted(deltas["model"].unique()):
+        model_deltas = deltas[deltas["model"] == model]
+        provider = model_deltas["provider"].iloc[0] if len(model_deltas) > 0 else "Unknown"
 
-        label = LEVEL_LABELS.get((dim, level), f"{dim}={level}")
-
-        if "composite_score_base" in grp.columns and "composite_score_iter" in grp.columns:
-            base_vals = grp["composite_score_base"].dropna()
-            iter_vals = grp["composite_score_iter"].dropna()
-
-            if len(base_vals) > 0:
-                base_mean = base_vals.mean()
-                iter_mean = iter_vals.mean()
-                delta = iter_mean - base_mean
-
-                # Paired t-test
-                if len(base_vals) > 1:
-                    t_stat, p_val = stats.ttest_rel(iter_vals.iloc[:len(base_vals)], base_vals)
-                else:
-                    t_stat, p_val = np.nan, np.nan
-
-                rows.append({
-                    "Dimension": DIM_LABELS.get(dim, dim),
-                    "Level": label,
-                    "N": len(base_vals),
-                    "Baseline_Mean": f"{base_mean*100:.1f}%",
-                    "Iteration_Mean": f"{iter_mean*100:.1f}%",
-                    "Delta": f"{delta*100:+.1f}%",
-                    "T_Statistic": t_stat,
-                    "P_Value": p_val,
-                    "Base_Numeric": base_mean,
-                    "Iter_Numeric": iter_mean,
-                })
-
-    return pd.DataFrame(rows)
-
-def table6_psychologization(baseline_df: pd.DataFrame, delta_df: pd.DataFrame) -> pd.DataFrame:
-    """T6: Psychologization & error rates by dimension."""
-    if delta_df.empty:
-        return pd.DataFrame()
-
-    rows = []
-    for (dim, level), grp in delta_df.groupby(["dimension", "level"]):
-        if dim == "baseline":
-            continue
-
-        label = LEVEL_LABELS.get((dim, level), f"{dim}={level}")
-
-        # Baseline psychologization rate
-        baseline_psych = 0
-        if "psychologized" in baseline_df.columns:
-            baseline_psych_vals = baseline_df["psychologized"].dropna()
-            if len(baseline_psych_vals) > 0:
-                baseline_psych = baseline_psych_vals.mean()
-
-        # Iteration psychologization rate
-        iter_psych = 0
-        if "psychologized_iter" in grp.columns:
-            iter_psych_vals = grp["psychologized_iter"].dropna()
-            if len(iter_psych_vals) > 0:
-                iter_psych = iter_psych_vals.mean()
-
-        # Baseline error rate
-        baseline_error = 0
-        if "psychologization_error" in baseline_df.columns:
-            baseline_error_vals = baseline_df["psychologization_error"].dropna()
-            if len(baseline_error_vals) > 0:
-                baseline_error = baseline_error_vals.mean()
-
-        # Iteration error rate
-        iter_error = 0
-        if "psychologization_error_iter" in grp.columns:
-            iter_error_vals = grp["psychologization_error_iter"].dropna()
-            if len(iter_error_vals) > 0:
-                iter_error = iter_error_vals.mean()
-
-        rows.append({
-            "Dimension": DIM_LABELS.get(dim, dim),
-            "Level": label,
-            "Baseline_Psych_Rate": f"{baseline_psych*100:.1f}%",
-            "Iteration_Psych_Rate": f"{iter_psych*100:.1f}%",
-            "Psych_Delta": f"{(iter_psych - baseline_psych)*100:+.1f}%",
-            "Baseline_Error_Rate": f"{baseline_error*100:.1f}%",
-            "Iteration_Error_Rate": f"{iter_error*100:.1f}%",
-            "Error_Delta": f"{(iter_error - baseline_error)*100:+.1f}%",
-        })
-
-    return pd.DataFrame(rows)
-
-def table7_urgency_shifts(delta_df: pd.DataFrame) -> pd.DataFrame:
-    """T7: Urgency direction (downgraded/correct/upgraded) by dimension × level."""
-    if delta_df.empty:
-        return pd.DataFrame()
-
-    rows = []
-    for (dim, level), grp in delta_df.groupby(["dimension", "level"]):
-        if dim == "baseline":
-            continue
-
-        label = LEVEL_LABELS.get((dim, level), f"{dim}={level}")
-
-        downgraded = 0
-        upgraded = 0
-        correct = 0
-
-        if "urgency_downgraded_direction" in grp.columns:
-            downgraded = (grp["urgency_downgraded_direction"] == -1).sum()
-        if "urgency_upgraded_direction" in grp.columns:
-            upgraded = (grp["urgency_upgraded_direction"] == 1).sum()
-
-        total = len(grp)
-        correct = total - downgraded - upgraded
-
-        downgraded_pct = (downgraded / total * 100) if total > 0 else 0
-        correct_pct = (correct / total * 100) if total > 0 else 0
-        upgraded_pct = (upgraded / total * 100) if total > 0 else 0
-
-        rows.append({
-            "Dimension": DIM_LABELS.get(dim, dim),
-            "Level": label,
-            "N": total,
-            "Downgraded": f"{downgraded} ({downgraded_pct:.1f}%)",
-            "Correct": f"{correct} ({correct_pct:.1f}%)",
-            "Upgraded": f"{upgraded} ({upgraded_pct:.1f}%)",
-        })
-
-    return pd.DataFrame(rows)
-
-def table8_statistical_tests(baseline_df: pd.DataFrame, delta_df: pd.DataFrame) -> pd.DataFrame:
-    """T8: Full statistical tests on all metrics with FDR correction."""
-    if delta_df.empty:
-        return pd.DataFrame()
-
-    rows = []
-    pvalues = []
-
-    metrics_to_test = [
-        ("refer_match_direction", "Referral Match"),
-        ("urgency_match_direction", "Urgency Match"),
-        ("labs_match_direction", "Labs Match"),
-        ("imaging_match_direction", "Imaging Match"),
-        ("aspiration_match_direction", "Aspiration Match"),
-        ("psychologized_direction", "Psychologized"),
-        ("urgency_downgraded_direction", "Urgency Downgraded"),
-        ("urgency_upgraded_direction", "Urgency Upgraded"),
-        ("acuity_match_direction", "Acuity Match"),
-    ]
-
-    for (dim, level), grp in delta_df.groupby(["dimension", "level"]):
-        if dim == "baseline":
-            continue
-
-        label = LEVEL_LABELS.get((dim, level), f"{dim}={level}")
-
-        for metric_col, metric_label in metrics_to_test:
-            if metric_col not in grp.columns:
+        for dim in sorted(model_deltas["dimension"].dropna().unique()):
+            if dim == "baseline":
                 continue
 
-            vals = grp[metric_col].dropna()
-            if len(vals) == 0:
-                continue
+            dim_data = model_deltas[model_deltas["dimension"] == dim]
 
-            mean_diff = vals.mean()
-            total = len(vals)
+            refer_changes = dim_data["refer_match_delta"].dropna()
+            urgency_changes = dim_data["urgency_match_delta"].dropna()
 
-            if total > 1:
-                t_stat, p_val = stats.ttest_1samp(vals, 0)
-            else:
-                t_stat, p_val = np.nan, np.nan
-
-            pvalues.append(p_val if not np.isnan(p_val) else 1.0)
-
-            rows.append({
+            results.append({
+                "Model": model,
+                "Provider": provider,
                 "Dimension": DIM_LABELS.get(dim, dim),
-                "Level": label,
-                "Metric": metric_label,
-                "N": total,
-                "Mean_Diff": f"{mean_diff:+.3f}",
-                "T_Statistic": f"{t_stat:.3f}" if not np.isnan(t_stat) else "N/A",
-                "P_Value": p_val,
+                "N": len(dim_data),
+                "Avg Refer Δ": f"{refer_changes.mean():.3f}" if len(refer_changes) > 0 else "N/A",
+                "Avg Urgency Δ": f"{urgency_changes.mean():.3f}" if len(urgency_changes) > 0 else "N/A",
             })
 
-    # Apply FDR correction
-    if pvalues:
-        rejected, corrected_p = apply_fdr_correction(pvalues)
-        for i, row in enumerate(rows):
-            row["FDR_Corrected_P"] = corrected_p[i]
-            row["Significant"] = "Yes" if rejected[i] else "No"
+    return pd.DataFrame(results)
 
-    return pd.DataFrame(rows)
+def table_decision_shifts_by_persona(deltas: pd.DataFrame) -> pd.DataFrame:
+    """T7: Decision shifts by persona × dimension."""
+    results = []
 
-def table9_per_model_shifts(delta_df: pd.DataFrame) -> pd.DataFrame:
-    """T9: Overall shift rates per model."""
-    if delta_df.empty:
-        return pd.DataFrame()
+    for persona in sorted(deltas["persona"].unique()):
+        persona_deltas = deltas[deltas["persona"] == persona]
 
-    rows = []
-    for model in sorted(delta_df["model"].unique()):
-        model_data = delta_df[delta_df["model"] == model]
+        for dim in sorted(persona_deltas["dimension"].dropna().unique()):
+            if dim == "baseline":
+                continue
 
-        total_pairs = len(model_data)
-        if total_pairs == 0:
-            continue
+            dim_data = persona_deltas[persona_deltas["dimension"] == dim]
+            refer_changes = dim_data["refer_match_delta"].dropna()
 
-        metrics_changed = []
-        for metric in ["refer_match_changed", "urgency_match_changed", "labs_match_changed",
-                       "imaging_match_changed", "aspiration_match_changed"]:
-            if metric in model_data.columns:
-                changed = model_data[metric].fillna(0).astype(int).sum()
-                metrics_changed.append(changed)
+            results.append({
+                "Persona": PERSONA_LABELS.get(persona, persona),
+                "Dimension": DIM_LABELS.get(dim, dim),
+                "N": len(dim_data),
+                "Refer Change %": f"{refer_changes.mean()*100:.1f}%" if len(refer_changes) > 0 else "N/A",
+            })
 
-        total_changed = sum(metrics_changed)
-        overall_change_rate = total_changed / (total_pairs * len(metrics_changed)) if total_pairs > 0 else 0
+    return pd.DataFrame(results)
 
-        if "composite_delta" in model_data.columns:
-            composite_deltas = model_data["composite_delta"].dropna()
-            composite_mean_delta = composite_deltas.mean() if len(composite_deltas) > 0 else 0
-        else:
-            composite_mean_delta = 0
+def table_decision_shifts_by_provider(deltas: pd.DataFrame) -> pd.DataFrame:
+    """T8: Decision shifts by provider × dimension."""
+    results = []
 
-        rows.append({
-            "Model": model,
-            "N_Pairs": total_pairs,
-            "Overall_Change_Rate": f"{overall_change_rate*100:.1f}%",
-            "Composite_Mean_Delta": f"{composite_mean_delta*100:+.1f}%",
-            "Change_Numeric": overall_change_rate,
-            "Delta_Numeric": composite_mean_delta,
-        })
+    for provider in sorted(deltas["provider"].unique()):
+        provider_deltas = deltas[deltas["provider"] == provider]
 
-    return pd.DataFrame(rows)
+        for dim in sorted(provider_deltas["dimension"].dropna().unique()):
+            if dim == "baseline":
+                continue
 
-def table10_per_persona_shifts(delta_df: pd.DataFrame) -> pd.DataFrame:
-    """T10: Overall shift rates per persona."""
-    if delta_df.empty:
-        return pd.DataFrame()
+            dim_data = provider_deltas[provider_deltas["dimension"] == dim]
+            refer_changes = dim_data["refer_match_delta"].dropna()
 
-    rows = []
-    for persona in sorted(delta_df["persona"].unique()):
-        persona_data = delta_df[delta_df["persona"] == persona]
+            results.append({
+                "Provider": provider,
+                "Dimension": DIM_LABELS.get(dim, dim),
+                "N": len(dim_data),
+                "Avg Refer Change": f"{refer_changes.mean():.3f}" if len(refer_changes) > 0 else "N/A",
+            })
 
-        total_pairs = len(persona_data)
-        if total_pairs == 0:
-            continue
-
-        metrics_changed = []
-        for metric in ["refer_match_changed", "urgency_match_changed", "labs_match_changed",
-                       "imaging_match_changed", "aspiration_match_changed"]:
-            if metric in persona_data.columns:
-                changed = persona_data[metric].fillna(0).astype(int).sum()
-                metrics_changed.append(changed)
-
-        total_changed = sum(metrics_changed)
-        overall_change_rate = total_changed / (total_pairs * len(metrics_changed)) if total_pairs > 0 else 0
-
-        if "composite_delta" in persona_data.columns:
-            composite_deltas = persona_data["composite_delta"].dropna()
-            composite_mean_delta = composite_deltas.mean() if len(composite_deltas) > 0 else 0
-        else:
-            composite_mean_delta = 0
-
-        rows.append({
-            "Persona": PERSONA_LABELS.get(persona, persona),
-            "N_Pairs": total_pairs,
-            "Overall_Change_Rate": f"{overall_change_rate*100:.1f}%",
-            "Composite_Mean_Delta": f"{composite_mean_delta*100:+.1f}%",
-            "Change_Numeric": overall_change_rate,
-            "Delta_Numeric": composite_mean_delta,
-        })
-
-    return pd.DataFrame(rows)
-
+    return pd.DataFrame(results)
 
 # ============================================================================
-# FIGURE GENERATION
+# TABLE GENERATION: PSYCHOLOGIZATION & URGENCY
 # ============================================================================
 
-def _save_fig(fig, path: Path, title: str = ""):
-    """Save figure to PNG and add metadata."""
-    fig.savefig(path, format=FIG_FMT, dpi=DPI, bbox_inches="tight", pad_inches=0.2)
-    print(f"  Saved {path.name}")
-    plt.close(fig)
+def table_psychologization_rates(df: pd.DataFrame, deltas: pd.DataFrame) -> pd.DataFrame:
+    """T9: Psychologization rates by dimension × level."""
+    baseline_df = df[df["condition"] == "baseline"].copy()
+    baseline_psych_rate = baseline_df["psychologized"].mean()
 
-def figure1_baseline_accuracy(baseline_df: pd.DataFrame, output_dir: Path):
-    """fig01: Baseline accuracy bar chart with Wilson CIs."""
-    _style()
+    results = []
 
-    metrics = [
-        ("refer_match", "Referral"),
-        ("urgency_match", "Urgency"),
-        ("labs_match", "Labs"),
-        ("imaging_match", "Imaging"),
-        ("acuity_match", "Acuity"),
-        ("dx_match_primary", "Dx (Primary)"),
-        ("composite_score", "Composite"),
-    ]
-
-    values = []
-    ci_lower = []
-    ci_upper = []
-    labels = []
-
-    for col, label in metrics:
-        if col not in baseline_df.columns:
-            continue
-
-        vals = baseline_df[col].dropna()
-        if len(vals) > 0:
-            if col == "composite_score":
-                mean_val = vals.mean()
-                std_val = vals.std()
-                se_val = std_val / np.sqrt(len(vals))
-                lower = mean_val - 1.96 * se_val
-                upper = mean_val + 1.96 * se_val
-            else:
-                total = len(vals)
-                success = int(vals.sum())
-                mean_val = success / total if total > 0 else 0
-                lower, upper = wilson_ci(success, total)
-
-            values.append(mean_val * 100)
-            ci_lower.append(lower * 100)
-            ci_upper.append(upper * 100)
-            labels.append(label)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    x = np.arange(len(labels))
-    errors = [np.array(values) - np.array(ci_lower), np.array(ci_upper) - np.array(values)]
-
-    bars = ax.bar(x, values, yerr=errors, capsize=5, color=BLUE, alpha=0.8, edgecolor=GRID, linewidth=1.2)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=45, ha="right")
-    ax.set_ylabel("Accuracy (%)", fontsize=11)
-    ax.set_ylim(0, 105)
-    ax.axhline(y=50, color=GRID, linestyle="--", linewidth=0.8, alpha=0.5)
-    ax.grid(True, alpha=0.3, axis="y")
-
-    _header(fig, "Baseline Model Accuracy")
-    _wm(ax)
-    _save_fig(fig, output_dir / f"fig01_baseline_accuracy.{FIG_FMT}")
-
-def figure2_decision_change_heatmap(delta_df: pd.DataFrame, output_dir: Path):
-    """fig02: Decision-change heatmap."""
-    if delta_df.empty:
-        print("  Skipped fig02 (no delta data)")
-        return
-
-    _style()
-
-    metrics = ["refer_match_changed", "urgency_match_changed", "labs_match_changed",
-               "imaging_match_changed", "aspiration_match_changed"]
-
-    metric_labels = ["Referral", "Urgency", "Labs", "Imaging", "Aspiration"]
-
-    # Build matrix
-    dims_levels = []
-    for dim in sorted(delta_df["dimension"].unique(), key=dim_sort_key):
+    for dim in sorted(deltas["dimension"].dropna().unique()):
         if dim == "baseline":
             continue
-        for level in sorted(delta_df[delta_df["dimension"] == dim]["level"].unique()):
-            dims_levels.append((dim, level))
 
-    data = np.zeros((len(dims_levels), len(metrics)))
-    for i, (dim, level) in enumerate(dims_levels):
-        grp = delta_df[(delta_df["dimension"] == dim) & (delta_df["level"] == level)]
-        for j, metric in enumerate(metrics):
-            if metric in grp.columns:
-                changed = grp[metric].fillna(0).astype(int).sum()
-                total = len(grp)
-                data[i, j] = (changed / total * 100) if total > 0 else 0
+        dim_data = deltas[deltas["dimension"] == dim]
 
-    fig, ax = plt.subplots(figsize=(10, 12))
-    im = ax.imshow(data, cmap="RdYlGn_r", aspect="auto", vmin=0, vmax=100)
+        for level in sorted(dim_data["level"].dropna().unique()):
+            level_data = dim_data[dim_data["level"] == level]
 
-    ax.set_xticks(np.arange(len(metrics)))
-    ax.set_yticks(np.arange(len(dims_levels)))
-    ax.set_xticklabels(metric_labels, rotation=45, ha="right")
+            psych_count = (level_data["psychologized_iter"] == 1).sum()
+            total = len(level_data)
+            psych_rate = psych_count / total if total > 0 else 0
+            delta = psych_rate - baseline_psych_rate
 
-    y_labels = [LEVEL_LABELS.get((dim, level), f"{dim}={level}") for dim, level in dims_levels]
-    ax.set_yticklabels(y_labels, fontsize=9)
+            results.append({
+                "Dimension": DIM_LABELS.get(dim, dim),
+                "Level": LEVEL_LABELS.get((dim, level), level),
+                "N": total,
+                "Psychologized %": f"{psych_rate*100:.1f}%",
+                "Δ from Baseline": f"{delta*100:+.1f}%",
+            })
 
-    for i in range(len(dims_levels)):
-        for j in range(len(metrics)):
-            text = ax.text(j, i, f"{data[i, j]:.0f}%", ha="center", va="center",
-                          color="white" if data[i, j] > 50 else TXT, fontsize=9)
+    return pd.DataFrame(results)
 
-    cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label("Change Rate (%)", fontsize=10)
+def table_urgency_direction(deltas: pd.DataFrame) -> pd.DataFrame:
+    """T10: Urgency direction (downgraded/correct/upgraded) by dimension × level."""
+    results = []
 
-    _header(fig, "Decision Changes by Dimension × Level", "% of pairs with decision change")
-    _wm(ax)
-    _save_fig(fig, output_dir / f"fig02_decision_change_heatmap.{FIG_FMT}")
+    for dim in sorted(deltas["dimension"].dropna().unique()):
+        if dim == "baseline":
+            continue
 
-def figure3_referral_urgency_changes(delta_df: pd.DataFrame, output_dir: Path):
-    """fig03: Referral & urgency changes by dimension."""
-    if delta_df.empty:
-        print("  Skipped fig03 (no delta data)")
-        return
+        dim_data = deltas[deltas["dimension"] == dim]
 
+        for level in sorted(dim_data["level"].dropna().unique()):
+            level_data = dim_data[dim_data["level"] == level]
+
+            downgraded = (level_data["urgency_downgraded_iter"] == 1).sum()
+            upgraded = (level_data["urgency_upgraded_iter"] == 1).sum()
+            correct = len(level_data) - downgraded - upgraded
+            total = len(level_data)
+
+            results.append({
+                "Dimension": DIM_LABELS.get(dim, dim),
+                "Level": LEVEL_LABELS.get((dim, level), level),
+                "Downgraded": f"{downgraded/total*100:.1f}%" if total > 0 else "N/A",
+                "Correct": f"{correct/total*100:.1f}%" if total > 0 else "N/A",
+                "Upgraded": f"{upgraded/total*100:.1f}%" if total > 0 else "N/A",
+            })
+
+    return pd.DataFrame(results)
+
+# ============================================================================
+# TABLE GENERATION: COMPOSITE DELTAS & STATISTICAL TESTS
+# ============================================================================
+
+def table_composite_deltas(deltas: pd.DataFrame) -> pd.DataFrame:
+    """T11: Composite score deltas by dimension × level with paired t-tests."""
+    results = []
+
+    for dim in sorted(deltas["dimension"].dropna().unique()):
+        if dim == "baseline":
+            continue
+
+        dim_data = deltas[deltas["dimension"] == dim]
+
+        for level in sorted(dim_data["level"].dropna().unique()):
+            level_data = dim_data[dim_data["level"] == level]
+
+            deltas_list = level_data["composite_delta"].dropna()
+            if len(deltas_list) == 0:
+                continue
+
+            mean_delta = deltas_list.mean()
+            sd_delta = deltas_list.std()
+            se = sd_delta / np.sqrt(len(deltas_list))
+            ci_lower = mean_delta - 1.96 * se
+            ci_upper = mean_delta + 1.96 * se
+
+            # Paired t-test against 0
+            t_stat, p_val = stats.ttest_1samp(deltas_list, 0)
+
+            results.append({
+                "Dimension": DIM_LABELS.get(dim, dim),
+                "Level": LEVEL_LABELS.get((dim, level), level),
+                "N": len(deltas_list),
+                "Mean Δ": f"{mean_delta:.4f}",
+                "SD": f"{sd_delta:.4f}",
+                "95% CI": f"[{ci_lower:.4f}, {ci_upper:.4f}]",
+                "t-statistic": f"{t_stat:.3f}",
+                "p-value": f"{p_val:.4f}",
+                "Significant": "Yes" if p_val < ALPHA else "No",
+            })
+
+    return pd.DataFrame(results)
+
+def table_statistical_tests_master(df: pd.DataFrame, deltas: pd.DataFrame) -> pd.DataFrame:
+    """T12: Master statistical tests table with binomtest, FDR correction, Cohen's h."""
+    baseline_df = df[df["condition"] == "baseline"].copy()
+
+    all_tests = []
+
+    for dim in sorted(deltas["dimension"].dropna().unique()):
+        if dim == "baseline":
+            continue
+
+        dim_data = deltas[deltas["dimension"] == dim]
+
+        for level in sorted(dim_data["level"].dropna().unique()):
+            level_data = dim_data[dim_data["level"] == level]
+
+            # Test for refer_match change
+            refer_baseline = baseline_df["refer_match"].mean()
+            refer_count = (level_data["refer_match_iter"] == 1).sum()
+            refer_total = len(level_data)
+            refer_rate = refer_count / refer_total if refer_total > 0 else 0
+
+            if refer_total > 0:
+                try:
+                    binom_result = binomtest(refer_count, refer_total, refer_baseline, alternative="two-sided")
+                    all_tests.append({
+                        "Dimension": DIM_LABELS.get(dim, dim),
+                        "Level": LEVEL_LABELS.get((dim, level), level),
+                        "Metric": "Referral Match",
+                        "N": refer_total,
+                        "Count": refer_count,
+                        "Rate": f"{refer_rate*100:.1f}%",
+                        "Baseline": f"{refer_baseline*100:.1f}%",
+                        "p-value": binom_result.pvalue,
+                        "Cohen's h": cohens_h(refer_rate, refer_baseline),
+                    })
+                except:
+                    pass
+
+            # Test for urgency_match change
+            urgency_baseline = baseline_df["urgency_match"].mean()
+            urgency_count = (level_data["urgency_match_iter"] == 1).sum()
+            urgency_total = len(level_data)
+            urgency_rate = urgency_count / urgency_total if urgency_total > 0 else 0
+
+            if urgency_total > 0:
+                try:
+                    binom_result = binomtest(urgency_count, urgency_total, urgency_baseline, alternative="two-sided")
+                    all_tests.append({
+                        "Dimension": DIM_LABELS.get(dim, dim),
+                        "Level": LEVEL_LABELS.get((dim, level), level),
+                        "Metric": "Urgency Match",
+                        "N": urgency_total,
+                        "Count": urgency_count,
+                        "Rate": f"{urgency_rate*100:.1f}%",
+                        "Baseline": f"{urgency_baseline*100:.1f}%",
+                        "p-value": binom_result.pvalue,
+                        "Cohen's h": cohens_h(urgency_rate, urgency_baseline),
+                    })
+                except:
+                    pass
+
+    result_df = pd.DataFrame(all_tests)
+
+    # Apply FDR correction to p-values
+    if len(result_df) > 0 and "p-value" in result_df.columns:
+        pvals = result_df["p-value"].dropna().values
+        if len(pvals) > 0:
+            _, fdr_corrected = apply_fdr_correction(pvals.tolist())
+            fdr_col = np.full(len(result_df), np.nan)
+            fdr_col[:len(fdr_corrected)] = fdr_corrected
+            result_df["FDR-corrected p"] = fdr_col
+            result_df["Significant (FDR)"] = result_df["FDR-corrected p"] < ALPHA
+
+    return result_df
+
+# ============================================================================
+# TABLE GENERATION: RANKINGS
+# ============================================================================
+
+def table_model_ranking(df: pd.DataFrame) -> pd.DataFrame:
+    """T13: Model ranking by overall composite, referral, urgency, psychologization, susceptibility."""
+    baseline_df = df[df["condition"] == "baseline"].copy()
+
+    results = []
+    for model in sorted(baseline_df["model"].unique()):
+        model_data = baseline_df[baseline_df["model"] == model]
+        provider = model_data["provider"].iloc[0] if len(model_data) > 0 else "Unknown"
+
+        composite = model_data["composite_score"].mean()
+        referral = model_data["refer_match"].mean()
+        urgency = model_data["urgency_match"].mean()
+        psych = model_data["psychologized"].mean()
+
+        results.append({
+            "Model": model,
+            "Provider": provider,
+            "Composite Score": f"{composite:.4f}",
+            "Referral Accuracy": f"{referral*100:.1f}%",
+            "Urgency Accuracy": f"{urgency*100:.1f}%",
+            "Psychologization %": f"{psych*100:.1f}%",
+        })
+
+    result_df = pd.DataFrame(results)
+    # Sort by composite score descending
+    result_df["Composite Numeric"] = pd.to_numeric(result_df["Composite Score"])
+    result_df = result_df.sort_values("Composite Numeric", ascending=False).drop("Composite Numeric", axis=1)
+    result_df.insert(0, "Rank", range(1, len(result_df) + 1))
+
+    return result_df
+
+def table_dimension_ranking(deltas: pd.DataFrame) -> pd.DataFrame:
+    """T14: Dimension ranking by overall shift rates."""
+    results = []
+
+    for dim in sorted(deltas["dimension"].dropna().unique()):
+        if dim == "baseline":
+            continue
+
+        dim_data = deltas[deltas["dimension"] == dim]
+
+        refer_changes = dim_data["refer_match_delta"].dropna()
+        urgency_changes = dim_data["urgency_match_delta"].dropna()
+
+        avg_shift = np.mean([abs(refer_changes.mean()) if len(refer_changes) > 0 else 0,
+                             abs(urgency_changes.mean()) if len(urgency_changes) > 0 else 0])
+
+        # Assign to dimension group
+        dim_group = None
+        for group, dims in DIM_GROUPS.items():
+            if dim in dims:
+                dim_group = group
+                break
+
+        results.append({
+            "Dimension": DIM_LABELS.get(dim, dim),
+            "Group": dim_group,
+            "Mean |Shift|": f"{avg_shift:.4f}",
+        })
+
+    result_df = pd.DataFrame(results)
+    result_df["Mean Numeric"] = pd.to_numeric(result_df["Mean |Shift|"])
+    result_df = result_df.sort_values("Mean Numeric", ascending=False)
+    result_df.insert(0, "Rank", range(1, len(result_df) + 1))
+    result_df = result_df.drop("Mean Numeric", axis=1)
+
+    return result_df
+
+def table_pairwise_comparisons(deltas: pd.DataFrame) -> pd.DataFrame:
+    """T15: Pairwise within-dimension comparisons (e.g., Black vs White vs Hispanic)."""
+    results = []
+
+    # Focus on race, ses, tone, anchoring dimensions which have multiple levels
+    pairwise_dims = ["race", "ses", "tone", "anchoring"]
+
+    for dim in pairwise_dims:
+        dim_data = deltas[deltas["dimension"] == dim]
+        levels = sorted(dim_data["level"].dropna().unique())
+
+        if len(levels) < 2:
+            continue
+
+        for i, level1 in enumerate(levels):
+            for level2 in levels[i+1:]:
+                l1_data = dim_data[dim_data["level"] == level1]
+                l2_data = dim_data[dim_data["level"] == level2]
+
+                # Chi-square or Fisher's exact for refer_match
+                try:
+                    refer1 = (l1_data["refer_match_iter"] == 1).sum()
+                    refer2 = (l2_data["refer_match_iter"] == 1).sum()
+                    total1 = len(l1_data)
+                    total2 = len(l2_data)
+
+                    if total1 > 0 and total2 > 0:
+                        contingency = np.array([[refer1, total1 - refer1],
+                                               [refer2, total2 - refer2]])
+                        try:
+                            chi2, p_val, dof, expected = chi2_contingency(contingency)
+                        except:
+                            p_val = np.nan
+
+                        results.append({
+                            "Dimension": DIM_LABELS.get(dim, dim),
+                            "Level 1": LEVEL_LABELS.get((dim, level1), level1),
+                            "Level 2": LEVEL_LABELS.get((dim, level2), level2),
+                            "Rate 1 %": f"{refer1/total1*100:.1f}%" if total1 > 0 else "N/A",
+                            "Rate 2 %": f"{refer2/total2*100:.1f}%" if total2 > 0 else "N/A",
+                            "p-value": f"{p_val:.4f}" if not np.isnan(p_val) else "N/A",
+                        })
+                except:
+                    pass
+
+    return pd.DataFrame(results)
+
+# ============================================================================
+# FIGURE GENERATION: BASELINE ACCURACY & DECISION CHANGES
+# ============================================================================
+
+def fig_baseline_accuracy_pooled(df: pd.DataFrame, output_dir: Path):
+    """fig01: Baseline accuracy bar chart with Wilson CI (pooled)."""
     _style()
+    baseline_df = df[df["condition"] == "baseline"].copy()
 
-    dims = sorted([d for d in delta_df["dimension"].unique() if d != "baseline"], key=dim_sort_key)
+    metrics = ["refer_match", "urgency_match", "imaging_match", "dx_match_primary", "psychologized"]
+    metric_labels = ["Referral\nAccuracy", "Urgency\nAccuracy", "Imaging\nAccuracy", "Dx\nAccuracy", "Psychologized"]
 
-    referral_changes = []
-    urgency_changes = []
+    rates = []
+    cis_lower = []
+    cis_upper = []
 
-    for dim in dims:
-        dim_data = delta_df[delta_df["dimension"] == dim]
+    for metric in metrics:
+        successes = int(baseline_df[metric].sum())
+        total = len(baseline_df)
+        rate = successes / total if total > 0 else 0
+        lower, upper = wilson_ci(successes, total)
+        rates.append(rate)
+        cis_lower.append(rate - lower)
+        cis_upper.append(upper - rate)
 
-        if "refer_match_changed" in dim_data.columns:
-            ref_changed = dim_data["refer_match_changed"].fillna(0).astype(int).sum()
-            ref_total = len(dim_data)
-            referral_changes.append((ref_changed / ref_total * 100) if ref_total > 0 else 0)
-        else:
-            referral_changes.append(0)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = np.arange(len(metrics))
+    bars = ax.bar(x, rates, color=[BLUE, TEAL, AMBER, GREEN, RED], alpha=0.8, width=0.6)
+    ax.errorbar(x, rates, yerr=[cis_lower, cis_upper], fmt="none", ecolor=TXT, capsize=5, linewidth=2)
 
-        if "urgency_match_changed" in dim_data.columns:
-            urg_changed = dim_data["urgency_match_changed"].fillna(0).astype(int).sum()
-            urg_total = len(dim_data)
-            urgency_changes.append((urg_changed / urg_total * 100) if urg_total > 0 else 0)
-        else:
-            urgency_changes.append(0)
+    ax.set_ylabel("Accuracy / Rate", fontsize=12, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(metric_labels, fontsize=11)
+    ax.set_ylim([0, 1.0])
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+    ax.grid(axis="y", alpha=0.3)
+
+    _wm(ax)
+    _header(fig, "Baseline Clinical Accuracy", "All Models Pooled (n={})".format(len(baseline_df)))
+
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(output_dir / "fig01_baseline_accuracy_pooled.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig01_baseline_accuracy_pooled.png")
+
+def fig_baseline_by_model(df: pd.DataFrame, output_dir: Path):
+    """fig02: Baseline accuracy by model."""
+    _style()
+    baseline_df = df[df["condition"] == "baseline"].copy()
+
+    models = sorted(baseline_df["model"].unique())
+    composites = [baseline_df[baseline_df["model"] == m]["composite_score"].mean() for m in models]
+    providers = [baseline_df[baseline_df["model"] == m]["provider"].iloc[0] for m in models]
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    x = np.arange(len(dims))
-    width = 0.35
+    colors = [PROVIDER_COLORS.get(p, SLATE) for p in providers]
+    bars = ax.barh(range(len(models)), composites, color=colors, alpha=0.8)
 
-    bars1 = ax.bar(x - width/2, referral_changes, width, label="Referral", color=BLUE, alpha=0.8, edgecolor=GRID)
-    bars2 = ax.bar(x + width/2, urgency_changes, width, label="Urgency", color=RED, alpha=0.8, edgecolor=GRID)
+    ax.set_yticks(range(len(models)))
+    ax.set_yticklabels(models, fontsize=10)
+    ax.set_xlabel("Composite Score", fontsize=12, fontweight="bold")
+    ax.set_xlim([0, 1.0])
+    ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+    ax.grid(axis="x", alpha=0.3)
 
-    ax.set_xlabel("Dimension", fontsize=11)
-    ax.set_ylabel("Change Rate (%)", fontsize=11)
-    ax.set_xticks(x)
-    ax.set_xticklabels([DIM_LABELS.get(d, d) for d in dims], rotation=45, ha="right")
-    ax.legend(loc="upper right")
-    ax.grid(True, alpha=0.3, axis="y")
+    # Legend for providers
+    legend_patches = [mpatches.Patch(color=PROVIDER_COLORS.get(p, SLATE), label=p)
+                     for p in sorted(set(providers))]
+    ax.legend(handles=legend_patches, loc="lower right", fontsize=10)
 
-    _header(fig, "Referral & Urgency Changes by Dimension")
     _wm(ax)
-    _save_fig(fig, output_dir / f"fig03_referral_urgency_changes.{FIG_FMT}")
+    _header(fig, "Baseline Accuracy by Model", "Sorted by Provider")
 
-def figure4_psychologization_dual_panel(delta_df: pd.DataFrame, baseline_df: pd.DataFrame, output_dir: Path):
-    """fig04: Psychologization dual panel (baseline vs iteration)."""
-    if delta_df.empty:
-        print("  Skipped fig04 (no delta data)")
-        return
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(output_dir / "fig02_baseline_by_model.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig02_baseline_by_model.png")
 
+def fig_decision_change_heatmap_pooled(deltas: pd.DataFrame, output_dir: Path):
+    """fig03: Decision-change heatmap (dimension × level, urgency_match change rate) pooled."""
     _style()
 
-    dims = sorted([d for d in delta_df["dimension"].unique() if d != "baseline"], key=dim_sort_key)
+    # Build a tidy table of dim_label × level_label → urgency change rate
+    records = []
+    for dim in deltas["dimension"].dropna().unique():
+        if dim == "baseline":
+            continue
+        dim_data = deltas[deltas["dimension"] == dim]
+        for level in dim_data["level"].dropna().unique():
+            level_data = dim_data[dim_data["level"] == level]
+            if "urgency_match_changed" in level_data.columns:
+                rate = level_data["urgency_match_changed"].mean() * 100
+            else:
+                rate = level_data["urgency_match_delta"].abs().mean() * 100 if "urgency_match_delta" in level_data.columns else 0
+            records.append({
+                "Dimension": DIM_LABELS.get(dim, dim),
+                "Level": LEVEL_LABELS.get((dim, level), level),
+                "Rate": rate,
+                "dim_order": dim_sort_key(dim),
+            })
 
-    baseline_psych_rates = []
-    iteration_psych_rates = []
+    if not records:
+        plt.close("all")
+        print("⚠ fig03: No data for heatmap")
+        return
 
-    for dim in dims:
-        # Baseline rate
-        baseline_data = baseline_df[baseline_df["dimension"] == dim] if "dimension" in baseline_df.columns else baseline_df
-        if "psychologized" in baseline_data.columns:
-            base_psych = baseline_data["psychologized"].mean()
-        else:
-            base_psych = baseline_df["psychologized"].mean() if "psychologized" in baseline_df.columns else 0
+    rdf = pd.DataFrame(records).sort_values("dim_order")
 
-        baseline_psych_rates.append(base_psych * 100)
+    # Use a horizontal bar chart instead of heatmap for ragged data
+    fig, ax = plt.subplots(figsize=(12, max(6, len(records) * 0.35)))
+    labels = [f"{r['Dimension']} — {r['Level']}" for _, r in rdf.iterrows()]
+    colors = [DIM_COLORS.get(d, SLATE) for d in deltas["dimension"].dropna().unique() for _ in range(1)]
+    bar_colors = []
+    for _, r in rdf.iterrows():
+        dim_raw = [k for k, v in DIM_LABELS.items() if v == r["Dimension"]]
+        bar_colors.append(DIM_COLORS.get(dim_raw[0], SLATE) if dim_raw else SLATE)
 
-        # Iteration rate
-        dim_data = delta_df[delta_df["dimension"] == dim]
-        if "psychologized_iter" in dim_data.columns:
-            iter_psych = dim_data["psychologized_iter"].mean()
-        else:
-            iter_psych = 0
+    bars = ax.barh(range(len(rdf)), rdf["Rate"].values, color=bar_colors, alpha=0.8, height=0.7)
+    ax.set_yticks(range(len(rdf)))
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_xlabel("Urgency Decision Change Rate (%)", fontsize=12, fontweight="bold")
+    ax.invert_yaxis()
 
-        iteration_psych_rates.append(iter_psych * 100)
+    # Add value labels
+    for i, v in enumerate(rdf["Rate"].values):
+        ax.text(v + 0.2, i, f"{v:.1f}%", va="center", fontsize=8, color=TXT)
+
+    _wm(ax)
+    _header(fig, "Decision Change Rates (Urgency)", "Urgency accuracy change rate by dimension × level (all models pooled)")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.savefig(output_dir / "fig03_decision_heatmap_pooled.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig03_decision_heatmap_pooled.png")
+
+def fig_decision_change_heatmap_by_model(deltas: pd.DataFrame, output_dir: Path):
+    """fig04: Decision-change by model — faceted horizontal bar charts."""
+    _style()
+
+    models = sorted(deltas["model"].unique())
+    n_models = len(models)
+    n_cols = min(3, n_models)
+    n_rows = max(1, (n_models + n_cols - 1) // n_cols)
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+    if n_models == 1:
+        axes = np.array([axes])
+    axes = np.atleast_2d(axes).flatten()
+
+    for idx, model in enumerate(models):
+        ax = axes[idx]
+        model_deltas = deltas[deltas["model"] == model]
+
+        records = []
+        for dim in model_deltas["dimension"].dropna().unique():
+            if dim == "baseline":
+                continue
+            dim_data = model_deltas[model_deltas["dimension"] == dim]
+            for level in dim_data["level"].dropna().unique():
+                level_data = dim_data[dim_data["level"] == level]
+                if "urgency_match_changed" in level_data.columns:
+                    rate = level_data["urgency_match_changed"].mean() * 100
+                else:
+                    rate = level_data["urgency_match_delta"].abs().mean() * 100
+                records.append({
+                    "label": f"{DIM_LABELS.get(dim, dim)[:12]}—{LEVEL_LABELS.get((dim, level), level)[:15]}",
+                    "rate": rate,
+                    "dim_order": dim_sort_key(dim),
+                })
+
+        if records:
+            rdf = pd.DataFrame(records).sort_values("dim_order")
+            bar_y = range(len(rdf))
+            ax.barh(bar_y, rdf["rate"].values, color=BLUE, alpha=0.7, height=0.7)
+            ax.set_yticks(bar_y)
+            ax.set_yticklabels(rdf["label"].values, fontsize=7)
+            ax.invert_yaxis()
+            ax.set_xlabel("Urgency Change %", fontsize=9)
+
+        ax.set_title(model, fontsize=10, fontweight="bold")
+
+    for idx in range(len(models), len(axes)):
+        axes[idx].axis("off")
+
+    _header(fig, "Decision Changes by Model", "Urgency accuracy change rate per dimension × level")
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.savefig(output_dir / "fig04_decision_heatmap_by_model.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig04_decision_heatmap_by_model.png")
+
+def fig_referral_urgency_changes(deltas: pd.DataFrame, output_dir: Path):
+    """fig05: Referral & urgency change rates paired bars by dimension."""
+    _style()
+
+    dims_list = sorted([d for d in deltas["dimension"].dropna().unique() if d != "baseline"],
+                       key=dim_sort_key)
+
+    refer_means = []
+    urgency_means = []
+    dim_labels_plot = []
+
+    for dim in dims_list:
+        dim_data = deltas[deltas["dimension"] == dim]
+        refer_changes = dim_data["refer_match_delta"].dropna()
+        urgency_changes = dim_data["urgency_match_delta"].dropna()
+
+        refer_means.append(refer_changes.mean() if len(refer_changes) > 0 else 0)
+        urgency_means.append(urgency_changes.mean() if len(urgency_changes) > 0 else 0)
+        dim_labels_plot.append(DIM_LABELS.get(dim, dim))
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    x = np.arange(len(dims_list))
+    width = 0.35
+
+    bars1 = ax.bar(x - width/2, refer_means, width, label="Referral", color=BLUE, alpha=0.8)
+    bars2 = ax.bar(x + width/2, urgency_means, width, label="Urgency", color=TEAL, alpha=0.8)
+
+    ax.axhline(y=0, color=TXT, linestyle="-", linewidth=0.8)
+    ax.set_ylabel("Change in Match Rate", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Dimension", fontsize=12, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(dim_labels_plot, fontsize=11, rotation=45, ha="right")
+    ax.legend(fontsize=11)
+    ax.grid(axis="y", alpha=0.3)
+
+    _wm(ax)
+    _header(fig, "Referral & Urgency Decision Changes", "By Dimension (Pooled Models)")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(output_dir / "fig05_referral_urgency_changes.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig05_referral_urgency_changes.png")
+
+def fig_psychologization_by_dimension(df: pd.DataFrame, deltas: pd.DataFrame, output_dir: Path):
+    """fig06: Psychologization rates by dimension (bar + delta from baseline)."""
+    _style()
+
+    baseline_df = df[df["condition"] == "baseline"].copy()
+    baseline_psych = baseline_df["psychologized"].mean()
+
+    dims_list = sorted([d for d in deltas["dimension"].dropna().unique() if d != "baseline"],
+                       key=dim_sort_key)
+
+    psych_rates = []
+    deltas_psych = []
+    dim_labels_plot = []
+
+    for dim in dims_list:
+        dim_data = deltas[deltas["dimension"] == dim]
+        psych_count = (dim_data["psychologized_iter"] == 1).sum()
+        total = len(dim_data)
+        psych_rate = psych_count / total if total > 0 else 0
+
+        psych_rates.append(psych_rate)
+        deltas_psych.append(psych_rate - baseline_psych)
+        dim_labels_plot.append(DIM_LABELS.get(dim, dim))
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-    x = np.arange(len(dims))
-    width = 0.6
+    # Left: Absolute rates
+    colors_psych = [RED if d > baseline_psych else GREEN for d in psych_rates]
+    ax1.barh(range(len(dims_list)), psych_rates, color=colors_psych, alpha=0.8)
+    ax1.axvline(x=baseline_psych, color=TXT, linestyle="--", linewidth=2, label="Baseline")
+    ax1.set_yticks(range(len(dims_list)))
+    ax1.set_yticklabels(dim_labels_plot, fontsize=11)
+    ax1.set_xlabel("Psychologization Rate", fontsize=12, fontweight="bold")
+    ax1.xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+    ax1.legend(fontsize=10)
+    ax1.grid(axis="x", alpha=0.3)
 
-    # Left: baseline vs iteration
-    bars1 = ax1.bar(x - width/2, baseline_psych_rates, width, label="Baseline", color=BLUE, alpha=0.7, edgecolor=GRID)
-    bars2 = ax1.bar(x + width/2, iteration_psych_rates, width, label="Iteration", color=RED, alpha=0.7, edgecolor=GRID)
-    ax1.set_xlabel("Dimension", fontsize=11)
-    ax1.set_ylabel("Psychologization Rate (%)", fontsize=11)
-    ax1.set_xticks(x)
-    ax1.set_xticklabels([DIM_LABELS.get(d, d) for d in dims], rotation=45, ha="right")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3, axis="y")
-
-    # Right: delta
-    deltas = [iter_psych_rates[i] - baseline_psych_rates[i] for i in range(len(dims))]
-    colors_delta = [RED if d > 0 else GREEN for d in deltas]
-    bars3 = ax2.barh(range(len(dims)), deltas, color=colors_delta, alpha=0.7, edgecolor=GRID)
-    ax2.set_yticks(range(len(dims)))
-    ax2.set_yticklabels([DIM_LABELS.get(d, d) for d in dims], fontsize=10)
-    ax2.set_xlabel("Psychologization Change (pp)", fontsize=11)
+    # Right: Delta from baseline
+    colors_delta = [RED if d > 0 else GREEN for d in deltas_psych]
+    ax2.barh(range(len(dims_list)), deltas_psych, color=colors_delta, alpha=0.8)
     ax2.axvline(x=0, color=TXT, linestyle="-", linewidth=0.8)
-    ax2.grid(True, alpha=0.3, axis="x")
+    ax2.set_yticks(range(len(dims_list)))
+    ax2.set_yticklabels(dim_labels_plot, fontsize=11)
+    ax2.set_xlabel("Δ from Baseline", fontsize=12, fontweight="bold")
+    ax2.xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+    ax2.grid(axis="x", alpha=0.3)
 
-    _header(fig, "Psychologization Rates by Dimension")
     _wm(ax1)
     _wm(ax2)
-    _save_fig(fig, output_dir / f"fig04_psychologization_dual_panel.{FIG_FMT}")
+    _header(fig, "Psychologization Rates by Dimension", "Baseline: {:.1f}%".format(baseline_psych * 100))
 
-def figure5_urgency_direction_stacked(delta_df: pd.DataFrame, output_dir: Path):
-    """fig05: Urgency direction stacked bar (downgraded/correct/upgraded)."""
-    if delta_df.empty:
-        print("  Skipped fig05 (no delta data)")
-        return
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(output_dir / "fig06_psychologization_by_dimension.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig06_psychologization_by_dimension.png")
 
+def fig_urgency_direction_stacked(deltas: pd.DataFrame, output_dir: Path):
+    """fig07: Urgency direction stacked bar (down/correct/up by dimension)."""
     _style()
 
-    dims = sorted([d for d in delta_df["dimension"].unique() if d != "baseline"], key=dim_sort_key)
+    dims_list = sorted([d for d in deltas["dimension"].dropna().unique() if d != "baseline"],
+                       key=dim_sort_key)
 
-    downgraded_pcts = []
-    correct_pcts = []
-    upgraded_pcts = []
+    downgraded_rates = []
+    correct_rates = []
+    upgraded_rates = []
+    dim_labels_plot = []
 
-    for dim in dims:
-        dim_data = delta_df[delta_df["dimension"] == dim]
+    for dim in dims_list:
+        dim_data = deltas[deltas["dimension"] == dim]
+
+        downgraded = (dim_data["urgency_downgraded_iter"] == 1).sum()
+        upgraded = (dim_data["urgency_upgraded_iter"] == 1).sum()
+        correct = len(dim_data) - downgraded - upgraded
         total = len(dim_data)
 
-        if total == 0:
-            downgraded_pcts.append(0)
-            correct_pcts.append(0)
-            upgraded_pcts.append(0)
-            continue
-
-        downgraded = 0
-        upgraded = 0
-
-        if "urgency_downgraded_direction" in dim_data.columns:
-            downgraded = (dim_data["urgency_downgraded_direction"] == -1).sum()
-        if "urgency_upgraded_direction" in dim_data.columns:
-            upgraded = (dim_data["urgency_upgraded_direction"] == 1).sum()
-
-        correct = total - downgraded - upgraded
-
-        downgraded_pcts.append((downgraded / total * 100) if total > 0 else 0)
-        correct_pcts.append((correct / total * 100) if total > 0 else 0)
-        upgraded_pcts.append((upgraded / total * 100) if total > 0 else 0)
+        downgraded_rates.append(downgraded / total if total > 0 else 0)
+        correct_rates.append(correct / total if total > 0 else 0)
+        upgraded_rates.append(upgraded / total if total > 0 else 0)
+        dim_labels_plot.append(DIM_LABELS.get(dim, dim))
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    x = np.arange(len(dims))
-    width = 0.6
+    x = np.arange(len(dims_list))
 
-    p1 = ax.bar(x, downgraded_pcts, width, label="Downgraded", color=RED, alpha=0.8, edgecolor=GRID)
-    p2 = ax.bar(x, correct_pcts, width, bottom=downgraded_pcts, label="Correct", color=GREEN, alpha=0.8, edgecolor=GRID)
+    ax.bar(x, downgraded_rates, label="Downgraded", color=RED, alpha=0.8)
+    ax.bar(x, correct_rates, bottom=downgraded_rates, label="Correct", color=GREEN, alpha=0.8)
+    ax.bar(x, upgraded_rates, bottom=np.array(downgraded_rates) + np.array(correct_rates),
+           label="Upgraded", color=AMBER, alpha=0.8)
 
-    bottom = np.array(downgraded_pcts) + np.array(correct_pcts)
-    p3 = ax.bar(x, upgraded_pcts, width, bottom=bottom, label="Upgraded", color=AMBER, alpha=0.8, edgecolor=GRID)
-
-    ax.set_xlabel("Dimension", fontsize=11)
-    ax.set_ylabel("Proportion (%)", fontsize=11)
+    ax.set_ylabel("Proportion", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Dimension", fontsize=12, fontweight="bold")
     ax.set_xticks(x)
-    ax.set_xticklabels([DIM_LABELS.get(d, d) for d in dims], rotation=45, ha="right")
-    ax.legend(loc="upper right")
-    ax.set_ylim(0, 105)
-    ax.grid(True, alpha=0.3, axis="y")
+    ax.set_xticklabels(dim_labels_plot, fontsize=11, rotation=45, ha="right")
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+    ax.legend(fontsize=11, loc="upper right")
+    ax.grid(axis="y", alpha=0.3)
 
-    _header(fig, "Urgency Direction Changes by Dimension")
     _wm(ax)
-    _save_fig(fig, output_dir / f"fig05_urgency_direction_stacked.{FIG_FMT}")
+    _header(fig, "Urgency Direction Changes", "By Dimension (Pooled Models)")
 
-def figure6_composite_delta_diverging(delta_df: pd.DataFrame, output_dir: Path):
-    """fig06: Composite delta diverging bar."""
-    if delta_df.empty or "composite_delta" not in delta_df.columns:
-        print("  Skipped fig06 (no composite delta)")
-        return
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(output_dir / "fig07_urgency_direction_stacked.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig07_urgency_direction_stacked.png")
 
+def fig_composite_delta_diverging(deltas: pd.DataFrame, output_dir: Path):
+    """fig08: Composite delta diverging bar by dimension × level."""
     _style()
 
-    dims = sorted([d for d in delta_df["dimension"].unique() if d != "baseline"], key=dim_sort_key)
+    dims_list = sorted([d for d in deltas["dimension"].dropna().unique() if d != "baseline"],
+                       key=dim_sort_key)
 
-    deltas = []
-    dim_labels_list = []
+    all_deltas_data = []
 
-    for dim in dims:
-        dim_data = delta_df[delta_df["dimension"] == dim]
-        if "composite_delta" in dim_data.columns:
-            delta_mean = dim_data["composite_delta"].mean() * 100
-        else:
-            delta_mean = 0
+    for dim in dims_list:
+        dim_data = deltas[deltas["dimension"] == dim]
+        levels = sorted(dim_data["level"].dropna().unique())
 
-        deltas.append(delta_mean)
-        dim_labels_list.append(DIM_LABELS.get(dim, dim))
+        for level in levels:
+            level_data = dim_data[dim_data["level"] == level]
+            composite_deltas = level_data["composite_delta"].dropna()
+            mean_delta = composite_deltas.mean() if len(composite_deltas) > 0 else 0
 
-    fig, ax = plt.subplots(figsize=(10, 8))
-    colors = [RED if d > 0 else GREEN for d in deltas]
-    bars = ax.barh(range(len(dims)), deltas, color=colors, alpha=0.8, edgecolor=GRID)
+            all_deltas_data.append({
+                "label": "{} - {}".format(DIM_LABELS.get(dim, dim), LEVEL_LABELS.get((dim, level), level)),
+                "delta": mean_delta,
+            })
 
-    ax.set_yticks(range(len(dims)))
-    ax.set_yticklabels(dim_labels_list, fontsize=10)
-    ax.set_xlabel("Composite Score Change (pp)", fontsize=11)
+    # Sort by delta
+    all_deltas_data = sorted(all_deltas_data, key=lambda x: x["delta"])
+
+    labels_plot = [d["label"] for d in all_deltas_data[-15:]]  # Top 15 to keep fig manageable
+    deltas_plot = [d["delta"] for d in all_deltas_data[-15:]]
+
+    colors_div = [RED if d < 0 else GREEN for d in deltas_plot]
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.barh(range(len(deltas_plot)), deltas_plot, color=colors_div, alpha=0.8)
     ax.axvline(x=0, color=TXT, linestyle="-", linewidth=0.8)
 
-    for i, (bar, delta) in enumerate(zip(bars, deltas)):
-        ax.text(delta + (0.5 if delta > 0 else -0.5), i, f"{delta:+.1f}pp",
-               va="center", ha="left" if delta > 0 else "right", fontsize=9)
+    ax.set_yticks(range(len(deltas_plot)))
+    ax.set_yticklabels(labels_plot, fontsize=10)
+    ax.set_xlabel("Composite Score Change", fontsize=12, fontweight="bold")
+    ax.grid(axis="x", alpha=0.3)
 
-    ax.grid(True, alpha=0.3, axis="x")
-
-    _header(fig, "Composite Score Change by Dimension", "Higher = worse")
     _wm(ax)
-    _save_fig(fig, output_dir / f"fig06_composite_delta_diverging.{FIG_FMT}")
+    _header(fig, "Composite Score Changes", "Dimension × Level (Top 15 by Magnitude)")
 
-def figure7_composite_by_dimension_box(delta_df: pd.DataFrame, output_dir: Path):
-    """fig07: Composite score by dimension box plot."""
-    if delta_df.empty or "composite_delta" not in delta_df.columns:
-        print("  Skipped fig07 (no composite delta)")
-        return
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(output_dir / "fig08_composite_delta_diverging.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig08_composite_delta_diverging.png")
 
+# ============================================================================
+# FIGURE GENERATION: MODEL & PROVIDER COMPARISONS
+# ============================================================================
+
+def fig_model_susceptibility_scatter(df: pd.DataFrame, deltas: pd.DataFrame, output_dir: Path):
+    """fig09: Model susceptibility scatter (x=baseline composite, y=mean shift rate)."""
     _style()
 
-    dims = sorted([d for d in delta_df["dimension"].unique() if d != "baseline"], key=dim_sort_key)
+    baseline_df = df[df["condition"] == "baseline"].copy()
 
-    data_to_plot = []
-    dim_labels_list = []
+    model_stats = []
+    for model in sorted(baseline_df["model"].unique()):
+        model_baseline = baseline_df[baseline_df["model"] == model]
+        model_deltas = deltas[deltas["model"] == model]
 
-    for dim in dims:
-        dim_data = delta_df[delta_df["dimension"] == dim]
-        if "composite_delta" in dim_data.columns:
-            deltas = dim_data["composite_delta"].dropna().values * 100
-            if len(deltas) > 0:
-                data_to_plot.append(deltas)
-                dim_labels_list.append(DIM_LABELS.get(dim, dim))
+        composite = model_baseline["composite_score"].mean()
 
-    if not data_to_plot:
-        print("  Skipped fig07 (no data)")
-        return
+        refer_shifts = model_deltas["refer_match_delta"].dropna()
+        urgency_shifts = model_deltas["urgency_match_delta"].dropna()
 
-    fig, ax = plt.subplots(figsize=(12, 7))
-    bp = ax.boxplot(data_to_plot, labels=dim_labels_list, patch_artist=True)
+        mean_shift = np.mean([abs(refer_shifts.mean()) if len(refer_shifts) > 0 else 0,
+                             abs(urgency_shifts.mean()) if len(urgency_shifts) > 0 else 0])
 
-    for patch in bp["boxes"]:
-        patch.set_facecolor(BLUE)
-        patch.set_alpha(0.7)
+        provider = model_baseline["provider"].iloc[0] if len(model_baseline) > 0 else "Unknown"
 
-    ax.axhline(y=0, color=TXT, linestyle="--", linewidth=1, alpha=0.5)
-    ax.set_ylabel("Composite Score Change (pp)", fontsize=11)
-    ax.tick_params(axis="x", rotation=45)
-    ax.grid(True, alpha=0.3, axis="y")
+        model_stats.append({
+            "model": model,
+            "composite": composite,
+            "shift": mean_shift,
+            "provider": provider,
+        })
 
-    _header(fig, "Composite Score Distribution by Dimension")
-    _wm(ax)
-    _save_fig(fig, output_dir / f"fig07_composite_by_dimension_box.{FIG_FMT}")
+    fig, ax = plt.subplots(figsize=(10, 7))
 
-def figure8_disease_category_heatmap(delta_df: pd.DataFrame, output_dir: Path):
-    """fig08: Disease category × dimension interaction heatmap."""
-    if delta_df.empty or "gt_category" not in delta_df.columns:
-        print("  Skipped fig08 (no gt_category)")
-        return
+    for provider, color in PROVIDER_COLORS.items():
+        provider_stats = [m for m in model_stats if m["provider"] == provider]
+        if provider_stats:
+            composites = [m["composite"] for m in provider_stats]
+            shifts = [m["shift"] for m in provider_stats]
+            ax.scatter(composites, shifts, s=150, color=color, alpha=0.7, label=provider, edgecolors=TXT, linewidth=1.5)
 
-    _style()
+            for m in provider_stats:
+                ax.annotate(m["model"], (m["composite"], m["shift"]), fontsize=8, ha="center", va="bottom")
 
-    dims = sorted([d for d in delta_df["dimension"].unique() if d != "baseline"], key=dim_sort_key)
-    categories = sorted([c for c in delta_df["gt_category"].unique() if pd.notna(c)])
-
-    if len(categories) == 0 or len(dims) == 0:
-        print("  Skipped fig08 (insufficient data)")
-        return
-
-    data = np.zeros((len(categories), len(dims)))
-
-    for i, cat in enumerate(categories):
-        for j, dim in enumerate(dims):
-            subset = delta_df[(delta_df["gt_category"] == cat) & (delta_df["dimension"] == dim)]
-            if len(subset) > 0 and "composite_delta" in subset.columns:
-                delta_mean = subset["composite_delta"].mean() * 100
-                data[i, j] = delta_mean
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    im = ax.imshow(data, cmap="RdYlGn_r", aspect="auto", vmin=-20, vmax=20)
-
-    ax.set_xticks(np.arange(len(dims)))
-    ax.set_yticks(np.arange(len(categories)))
-    ax.set_xticklabels([DIM_LABELS.get(d, d) for d in dims], rotation=45, ha="right")
-    ax.set_yticklabels([str(c) for c in categories])
-
-    for i in range(len(categories)):
-        for j in range(len(dims)):
-            text = ax.text(j, i, f"{data[i, j]:.1f}",
-                          ha="center", va="center", color="white" if abs(data[i, j]) > 10 else TXT, fontsize=9)
-
-    cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label("Mean Composite Delta (pp)", fontsize=10)
-
-    ax.set_xlabel("Dimension", fontsize=11)
-    ax.set_ylabel("Disease Category", fontsize=11)
-
-    _header(fig, "Disease Category × Dimension Interaction")
-    _wm(ax)
-    _save_fig(fig, output_dir / f"fig08_disease_category_heatmap.{FIG_FMT}")
-
-def figure9_persona_susceptibility(delta_df: pd.DataFrame, output_dir: Path):
-    """fig09: Persona susceptibility scatter."""
-    if delta_df.empty:
-        print("  Skipped fig09 (no delta data)")
-        return
-
-    _style()
-
-    personas = sorted(delta_df["persona"].unique())
-    dims = sorted([d for d in delta_df["dimension"].unique() if d != "baseline"], key=dim_sort_key)
-
-    fig, ax = plt.subplots(figsize=(12, 7))
-
-    for persona in personas:
-        persona_data = delta_df[delta_df["persona"] == persona]
-
-        x_vals = []
-        y_vals = []
-
-        for dim in dims:
-            dim_data = persona_data[persona_data["dimension"] == dim]
-            if len(dim_data) > 0 and "composite_delta" in dim_data.columns:
-                delta_mean = dim_data["composite_delta"].mean() * 100
-                x_vals.append(dims.index(dim))
-                y_vals.append(delta_mean)
-
-        color = PERSONA_COLORS.get(persona, SLATE)
-        ax.scatter(x_vals, y_vals, s=100, alpha=0.7, label=PERSONA_LABELS.get(persona, persona), color=color)
-
-    ax.set_xticks(range(len(dims)))
-    ax.set_xticklabels([DIM_LABELS.get(d, d) for d in dims], rotation=45, ha="right")
-    ax.set_ylabel("Composite Score Change (pp)", fontsize=11)
-    ax.axhline(y=0, color=TXT, linestyle="--", linewidth=0.8, alpha=0.5)
-    ax.legend(loc="best")
+    ax.set_xlabel("Baseline Composite Score", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Mean |Shift Rate| (Refer + Urgency)", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=11, loc="best")
     ax.grid(True, alpha=0.3)
 
-    _header(fig, "Persona Susceptibility by Dimension")
     _wm(ax)
-    _save_fig(fig, output_dir / f"fig09_persona_susceptibility.{FIG_FMT}")
+    _header(fig, "Model Susceptibility to Bias", "Baseline Accuracy vs. Decision Shift Magnitude")
 
-def figure10_model_persona_heatmap(delta_df: pd.DataFrame, output_dir: Path):
-    """fig10: Model × Persona interaction heatmap."""
-    if delta_df.empty:
-        print("  Skipped fig10 (no delta data)")
-        return
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(output_dir / "fig09_model_susceptibility_scatter.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig09_model_susceptibility_scatter.png")
 
+def fig_model_dimension_heatmap(deltas: pd.DataFrame, output_dir: Path):
+    """fig10: Model × dimension heatmap (mean composite delta)."""
     _style()
 
-    models = sorted(delta_df["model"].unique())
-    personas = sorted(delta_df["persona"].unique())
+    models = sorted(deltas["model"].unique())
+    dims_list = sorted([d for d in deltas["dimension"].dropna().unique() if d != "baseline"],
+                       key=dim_sort_key)
 
-    data = np.zeros((len(personas), len(models)))
+    heatmap_data = []
+    for model in models:
+        row = []
+        model_deltas = deltas[deltas["model"] == model]
+        for dim in dims_list:
+            dim_data = model_deltas[model_deltas["dimension"] == dim]
+            comp_deltas = dim_data["composite_delta"].dropna()
+            mean_delta = comp_deltas.mean() if len(comp_deltas) > 0 else 0
+            row.append(mean_delta)
+        heatmap_data.append(row)
 
-    for i, persona in enumerate(personas):
-        for j, model in enumerate(models):
-            subset = delta_df[(delta_df["persona"] == persona) & (delta_df["model"] == model)]
-            if len(subset) > 0 and "composite_delta" in subset.columns:
-                delta_mean = subset["composite_delta"].mean() * 100
-                data[i, j] = delta_mean
+    fig, ax = plt.subplots(figsize=(12, 8))
+    heatmap_array = np.array(heatmap_data, dtype=float)
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    im = ax.imshow(data, cmap="RdYlGn_r", aspect="auto", vmin=-20, vmax=20)
+    im = ax.imshow(heatmap_array, cmap="RdBu_r", aspect="auto", vmin=-0.2, vmax=0.2)
 
-    ax.set_xticks(np.arange(len(models)))
-    ax.set_yticks(np.arange(len(personas)))
-    ax.set_xticklabels(models, rotation=45, ha="right")
-    ax.set_yticklabels([PERSONA_LABELS.get(p, p) for p in personas])
+    ax.set_xticks(range(len(dims_list)))
+    ax.set_yticks(range(len(models)))
+    ax.set_xticklabels([DIM_LABELS.get(d, d) for d in dims_list], fontsize=11, rotation=45, ha="right")
+    ax.set_yticklabels(models, fontsize=11)
 
-    for i in range(len(personas)):
-        for j in range(len(models)):
-            text = ax.text(j, i, f"{data[i, j]:.1f}",
-                          ha="center", va="center", color="white" if abs(data[i, j]) > 10 else TXT, fontsize=9)
+    ax.set_xlabel("Dimension", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Model", fontsize=12, fontweight="bold")
 
     cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label("Mean Composite Delta (pp)", fontsize=10)
+    cbar.set_label("Mean Composite Δ", fontsize=11, fontweight="bold")
 
-    ax.set_xlabel("Model", fontsize=11)
-    ax.set_ylabel("Persona", fontsize=11)
-
-    _header(fig, "Model × Persona Interaction")
     _wm(ax)
-    _save_fig(fig, output_dir / f"fig10_model_persona_heatmap.{FIG_FMT}")
+    _header(fig, "Model × Dimension Composite Score Changes", "Heatmap of Bias Impact")
 
-def figure11_model_shift_paired_dot(delta_df: pd.DataFrame, output_dir: Path):
-    """fig11: Model shift paired dot plot."""
-    if delta_df.empty:
-        print("  Skipped fig11 (no delta data)")
-        return
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(output_dir / "fig10_model_dimension_heatmap.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig10_model_dimension_heatmap.png")
 
+def fig_provider_comparison(df: pd.DataFrame, deltas: pd.DataFrame, output_dir: Path):
+    """fig11: Provider comparison (grouped bars)."""
     _style()
 
-    models = sorted(delta_df["model"].unique())
+    baseline_df = df[df["condition"] == "baseline"].copy()
+    providers = sorted(baseline_df["provider"].unique())
+
+    metrics_data = []
+    for provider in providers:
+        prov_baseline = baseline_df[baseline_df["provider"] == provider]
+        prov_deltas = deltas[deltas["provider"] == provider]
+
+        composite = prov_baseline["composite_score"].mean()
+        referral = prov_baseline["refer_match"].mean()
+        urgency = prov_baseline["urgency_match"].mean()
+
+        refer_shifts = prov_deltas["refer_match_delta"].dropna()
+        urgency_shifts = prov_deltas["urgency_match_delta"].dropna()
+        mean_shift = np.mean([abs(refer_shifts.mean()) if len(refer_shifts) > 0 else 0,
+                             abs(urgency_shifts.mean()) if len(urgency_shifts) > 0 else 0])
+
+        metrics_data.append({
+            "provider": provider,
+            "composite": composite,
+            "referral": referral,
+            "urgency": urgency,
+            "shift": mean_shift,
+        })
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+    # Composite score
+    ax = axes[0, 0]
+    composites = [m["composite"] for m in metrics_data]
+    ax.bar(range(len(providers)), composites, color=[PROVIDER_COLORS.get(p, SLATE) for p in providers], alpha=0.8)
+    ax.set_xticks(range(len(providers)))
+    ax.set_xticklabels(providers, fontsize=11)
+    ax.set_ylabel("Composite Score", fontsize=11, fontweight="bold")
+    ax.set_ylim([0, 1])
+    ax.grid(axis="y", alpha=0.3)
+
+    # Referral accuracy
+    ax = axes[0, 1]
+    referrals = [m["referral"] for m in metrics_data]
+    ax.bar(range(len(providers)), referrals, color=[PROVIDER_COLORS.get(p, SLATE) for p in providers], alpha=0.8)
+    ax.set_xticks(range(len(providers)))
+    ax.set_xticklabels(providers, fontsize=11)
+    ax.set_ylabel("Referral Accuracy", fontsize=11, fontweight="bold")
+    ax.set_ylim([0, 1])
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+    ax.grid(axis="y", alpha=0.3)
+
+    # Urgency accuracy
+    ax = axes[1, 0]
+    urgencies = [m["urgency"] for m in metrics_data]
+    ax.bar(range(len(providers)), urgencies, color=[PROVIDER_COLORS.get(p, SLATE) for p in providers], alpha=0.8)
+    ax.set_xticks(range(len(providers)))
+    ax.set_xticklabels(providers, fontsize=11)
+    ax.set_ylabel("Urgency Accuracy", fontsize=11, fontweight="bold")
+    ax.set_ylim([0, 1])
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+    ax.grid(axis="y", alpha=0.3)
+
+    # Susceptibility
+    ax = axes[1, 1]
+    shifts = [m["shift"] for m in metrics_data]
+    ax.bar(range(len(providers)), shifts, color=[PROVIDER_COLORS.get(p, SLATE) for p in providers], alpha=0.8)
+    ax.set_xticks(range(len(providers)))
+    ax.set_xticklabels(providers, fontsize=11)
+    ax.set_ylabel("Mean |Shift|", fontsize=11, fontweight="bold")
+    ax.grid(axis="y", alpha=0.3)
+
+    _wm(axes[0, 0])
+    _header(fig, "Provider Comparison", "OpenAI vs. Anthropic vs. Google")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(output_dir / "fig11_provider_comparison.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig11_provider_comparison.png")
+
+def fig_persona_susceptibility(deltas: pd.DataFrame, output_dir: Path):
+    """fig12: Persona susceptibility (mean shift rate per persona with CI)."""
+    _style()
+
+    personas = sorted(deltas["persona"].unique())
+
+    persona_shifts = []
+    for persona in personas:
+        persona_deltas = deltas[deltas["persona"] == persona]
+
+        refer_shifts = persona_deltas["refer_match_delta"].dropna()
+        urgency_shifts = persona_deltas["urgency_match_delta"].dropna()
+
+        refer_mean = abs(refer_shifts.mean()) if len(refer_shifts) > 0 else 0
+        urgency_mean = abs(urgency_shifts.mean()) if len(urgency_shifts) > 0 else 0
+
+        mean_shift = np.mean([refer_mean, urgency_mean])
+
+        # Compute CI (normal approximation)
+        all_shifts = []
+        if len(refer_shifts) > 0:
+            all_shifts.extend(refer_shifts.values)
+        if len(urgency_shifts) > 0:
+            all_shifts.extend(urgency_shifts.values)
+
+        if len(all_shifts) > 1:
+            se = np.std(all_shifts) / np.sqrt(len(all_shifts))
+            ci_lower = mean_shift - 1.96 * se
+            ci_upper = mean_shift + 1.96 * se
+        else:
+            ci_lower = ci_upper = mean_shift
+
+        persona_shifts.append({
+            "persona": persona,
+            "shift": mean_shift,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+        })
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    for i, model in enumerate(models):
-        model_data = delta_df[delta_df["model"] == model]
+    x = np.arange(len(personas))
+    shifts = [p["shift"] for p in persona_shifts]
+    ci_lowers = [max(0, p["ci_lower"]) for p in persona_shifts]
+    ci_uppers = [p["ci_upper"] for p in persona_shifts]
 
-        if "composite_delta" in model_data.columns:
-            deltas = model_data["composite_delta"].dropna().values * 100
+    colors_pers = [PERSONA_COLORS.get(p, SLATE) for p in personas]
 
-            y_pos = np.random.normal(i, 0.04, size=len(deltas))
-            ax.scatter(y_pos, deltas, alpha=0.5, s=30, color=BLUE)
+    ax.bar(x, shifts, color=colors_pers, alpha=0.8)
+    errors = [np.array(shifts) - np.array(ci_lowers), np.array(ci_uppers) - np.array(shifts)]
+    ax.errorbar(x, shifts, yerr=errors, fmt="none", ecolor=TXT, capsize=5, linewidth=2)
 
-            mean_delta = deltas.mean()
-            ax.plot(i, mean_delta, "D", markersize=10, color=RED, zorder=5)
+    ax.set_xticks(x)
+    ax.set_xticklabels([PERSONA_LABELS.get(p, p) for p in personas], fontsize=11)
+    ax.set_ylabel("Mean |Decision Shift|", fontsize=12, fontweight="bold")
+    ax.grid(axis="y", alpha=0.3)
 
-    ax.set_xticks(range(len(models)))
-    ax.set_xticklabels(models, rotation=45, ha="right")
-    ax.set_ylabel("Composite Score Change (pp)", fontsize=11)
-    ax.axhline(y=0, color=TXT, linestyle="--", linewidth=0.8, alpha=0.5)
-    ax.grid(True, alpha=0.3, axis="y")
-
-    _header(fig, "Model Shift: Individual Cases & Mean", "Red diamond = mean per model")
     _wm(ax)
-    _save_fig(fig, output_dir / f"fig11_model_shift_paired_dot.{FIG_FMT}")
+    _header(fig, "Persona Susceptibility to Bias", "Mean Shift Rate with 95% CI")
 
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(output_dir / "fig12_persona_susceptibility.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig12_persona_susceptibility.png")
+
+def fig_dimension_group_comparison(deltas: pd.DataFrame, output_dir: Path):
+    """fig13: Dimension group comparison."""
+    _style()
+
+    group_shifts = {}
+    for group, dims in DIM_GROUPS.items():
+        group_data = deltas[deltas["dimension"].isin(dims)]
+
+        refer_shifts = group_data["refer_match_delta"].dropna()
+        urgency_shifts = group_data["urgency_match_delta"].dropna()
+
+        refer_mean = abs(refer_shifts.mean()) if len(refer_shifts) > 0 else 0
+        urgency_mean = abs(urgency_shifts.mean()) if len(urgency_shifts) > 0 else 0
+
+        mean_shift = np.mean([refer_mean, urgency_mean])
+        group_shifts[group] = mean_shift
+
+    groups = sorted(group_shifts.keys())
+    shifts = [group_shifts[g] for g in groups]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    colors_group = [BLUE, TEAL, AMBER, INDIGO]
+    ax.bar(range(len(groups)), shifts, color=colors_group[:len(groups)], alpha=0.8)
+
+    ax.set_xticks(range(len(groups)))
+    ax.set_xticklabels(groups, fontsize=11, rotation=15, ha="right")
+    ax.set_ylabel("Mean |Decision Shift|", fontsize=12, fontweight="bold")
+    ax.grid(axis="y", alpha=0.3)
+
+    _wm(ax)
+    _header(fig, "Dimension Group Comparison", "Bias Impact by Bias Category")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(output_dir / "fig13_dimension_group_comparison.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig13_dimension_group_comparison.png")
+
+def fig_disease_category_dimension_interaction(df: pd.DataFrame, deltas: pd.DataFrame, output_dir: Path):
+    """fig14: Disease category × dimension interaction heatmap."""
+    _style()
+
+    categories = sorted(deltas["gt_category"].dropna().unique())
+    dims_list = sorted([d for d in deltas["dimension"].dropna().unique() if d != "baseline"],
+                       key=dim_sort_key)
+
+    if len(categories) == 0 or len(dims_list) == 0:
+        print("⊘ fig14: Insufficient data for disease × dimension heatmap")
+        return
+
+    heatmap_data = []
+    for cat in categories:
+        row = []
+        for dim in dims_list:
+            dim_cat_data = deltas[(deltas["dimension"] == dim) & (deltas["gt_category"] == cat)]
+            comp_deltas = dim_cat_data["composite_delta"].dropna()
+            mean_delta = comp_deltas.mean() if len(comp_deltas) > 0 else 0
+            row.append(mean_delta)
+        heatmap_data.append(row)
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    heatmap_array = np.array(heatmap_data, dtype=float)
+
+    im = ax.imshow(heatmap_array, cmap="RdBu_r", aspect="auto", vmin=-0.2, vmax=0.2)
+
+    ax.set_xticks(range(len(dims_list)))
+    ax.set_yticks(range(len(categories)))
+    ax.set_xticklabels([DIM_LABELS.get(d, d) for d in dims_list], fontsize=11, rotation=45, ha="right")
+    ax.set_yticklabels([str(c) for c in categories], fontsize=11)
+
+    ax.set_xlabel("Dimension", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Disease Category", fontsize=12, fontweight="bold")
+
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label("Mean Composite Δ", fontsize=11, fontweight="bold")
+
+    _wm(ax)
+    _header(fig, "Disease Category × Dimension Interaction", "Composite Score Changes")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(output_dir / "fig14_disease_dimension_interaction.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig14_disease_dimension_interaction.png")
+
+def fig_model_ranking_forest(df: pd.DataFrame, output_dir: Path):
+    """fig15: Forest plot — overall shift rates per model with CI."""
+    _style()
+
+    baseline_df = df[df["condition"] == "baseline"].copy()
+
+    models = sorted(baseline_df["model"].unique())
+    composites = []
+
+    for model in models:
+        model_data = baseline_df[baseline_df["model"] == model]
+        comp = model_data["composite_score"].mean()
+        composites.append(comp)
+
+    # Sort by composite score
+    sorted_indices = np.argsort(composites)[::-1]
+    models_sorted = [models[i] for i in sorted_indices]
+    composites_sorted = [composites[i] for i in sorted_indices]
+
+    fig, ax = plt.subplots(figsize=(11, 8))
+
+    y_pos = np.arange(len(models_sorted))
+    providers_sorted = [_get_provider(m) for m in models_sorted]
+    colors_forest = [PROVIDER_COLORS.get(p, SLATE) for p in providers_sorted]
+
+    ax.barh(y_pos, composites_sorted, color=colors_forest, alpha=0.8)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(models_sorted, fontsize=10)
+    ax.set_xlabel("Composite Score", fontsize=12, fontweight="bold")
+    ax.set_xlim([0, 1])
+    ax.xaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+    ax.grid(axis="x", alpha=0.3)
+
+    # Legend
+    legend_patches = [mpatches.Patch(color=PROVIDER_COLORS.get(p, SLATE), label=p)
+                     for p in sorted(set(providers_sorted))]
+    ax.legend(handles=legend_patches, loc="lower right", fontsize=10)
+
+    _wm(ax)
+    _header(fig, "Model Ranking: Baseline Clinical Accuracy", "Composite Score (Descending)")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(output_dir / "fig15_model_ranking_forest.png", dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print("✓ fig15_model_ranking_forest.png")
 
 # ============================================================================
 # PDF CONSOLIDATION
 # ============================================================================
 
-def consolidate_pdf(output_dir: Path):
+def consolidate_figures_to_pdf(output_dir: Path):
     """Consolidate all PNG figures into a single PDF."""
     try:
         from PIL import Image
@@ -1388,148 +1705,117 @@ def consolidate_pdf(output_dir: Path):
 
         fig_files = sorted(output_dir.glob("fig*.png"))
         if not fig_files:
-            print("  No figures found for PDF consolidation")
+            print("⊘ No figures found for PDF consolidation")
             return
 
-        images = []
-        for fig_file in fig_files:
-            img = Image.open(fig_file).convert("RGB")
-            images.append(img)
+        images = [Image.open(f).convert("RGB") for f in fig_files]
 
-        if images:
-            images[0].save(
-                output_dir / "all_figures.pdf",
-                save_all=True,
-                append_images=images[1:],
-                quality=95,
-                optimize=False
-            )
-            print(f"  Consolidated PDF: all_figures.pdf")
+        pdf_path = output_dir / "consolidated_figures.pdf"
+        images[0].save(pdf_path, save_all=True, append_images=images[1:])
+        print(f"✓ consolidated_figures.pdf ({len(images)} pages)")
     except Exception as e:
-        print(f"  Warning: Could not create PDF: {e}")
-
+        print(f"⊘ PDF consolidation failed: {e}")
 
 # ============================================================================
-# MAIN PIPELINE
+# MAIN EXECUTION
 # ============================================================================
 
 def main():
     """Main analysis pipeline."""
-    # Input handling
+    print("\n" + "="*70)
+    print("RHEUMATO BIAS PIPELINE: Multi-Model Analysis Suite")
+    print("="*70)
+
+    # Input/output paths
     if len(sys.argv) > 1:
         input_path = Path(sys.argv[1])
-        output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("./figures")
     else:
+        input_path = None
+
+    if len(sys.argv) > 2:
+        output_dir = Path(sys.argv[2])
+    else:
+        output_dir = None
+
+    if not input_path or not input_path.exists():
         input_path, output_dir = prompt_for_paths()
+    else:
+        if not output_dir:
+            output_dir = Path("./output")
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"\n{'='*80}")
-    print(f"Rheumato Bias Pipeline: Comprehensive Analysis")
-    print(f"{'='*80}\n")
-
-    # Load data
-    print(f"Loading data from: {input_path}")
+    print(f"\nLoading data from: {input_path}")
     df = load_data(input_path)
-    print(f"  Loaded {len(df)} records")
-    print(f"  Models: {sorted(df['model'].unique()) if 'model' in df.columns else 'N/A'}")
-    print(f"  Personas: {sorted(df['persona'].unique()) if 'persona' in df.columns else 'N/A'}")
-    print(f"  Cases: {df['case_id'].nunique() if 'case_id' in df.columns else 'N/A'}")
+    df = add_provider_column(df)
 
-    baseline_df = df[df["condition"] == "baseline"].copy()
-    print(f"  Baseline records: {len(baseline_df)}")
+    print(f"✓ Loaded {len(df)} records")
+    print(f"  Models: {df['model'].nunique()}")
+    print(f"  Providers: {df['provider'].nunique()}")
+    print(f"  Personas: {df['persona'].nunique()}")
+    print(f"  Cases: {df['case_id'].nunique()}")
 
     # Compute deltas
-    print(f"\nComputing deltas...")
-    delta_df = compute_deltas(df)
-    print(f"  Baseline-iteration pairs: {len(delta_df)}")
+    print("\nComputing decision deltas...")
+    deltas = compute_deltas(df)
+    print(f"✓ Computed {len(deltas)} baseline/injection pairs")
 
     # Generate tables
-    print(f"\nGenerating tables...")
+    print("\nGenerating tables...")
     tables = {}
 
-    print(f"  T1: Baseline Accuracy")
-    tables["T1_Baseline_Accuracy"] = table1_baseline_accuracy(baseline_df)
-
-    print(f"  T2: Baseline by Model")
-    tables["T2_Baseline_by_Model"] = table2_baseline_by_model(baseline_df)
-
-    print(f"  T3: Baseline by Persona")
-    tables["T3_Baseline_by_Persona"] = table3_baseline_by_persona(baseline_df)
-
-    print(f"  T4: Decision Shifts")
-    tables["T4_Decision_Shifts"] = table4_decision_shifts(delta_df)
-
-    print(f"  T5: Accuracy Change")
-    tables["T5_Accuracy_Change"] = table5_accuracy_change(delta_df)
-
-    print(f"  T6: Psychologization")
-    tables["T6_Psychologization"] = table6_psychologization(baseline_df, delta_df)
-
-    print(f"  T7: Urgency Shifts")
-    tables["T7_Urgency_Shifts"] = table7_urgency_shifts(delta_df)
-
-    print(f"  T8: Statistical Tests")
-    tables["T8_Statistical_Tests"] = table8_statistical_tests(baseline_df, delta_df)
-
-    print(f"  T9: Per-Model Shifts")
-    tables["T9_Per_Model_Shifts"] = table9_per_model_shifts(delta_df)
-
-    print(f"  T10: Per-Persona Shifts")
-    tables["T10_Per_Persona_Shifts"] = table10_per_persona_shifts(delta_df)
+    tables["T1_Baseline_Pooled"] = table_baseline_accuracy_pooled(df)
+    tables["T2_Baseline_by_Model"] = table_baseline_by_model(df)
+    tables["T3_Baseline_by_Persona"] = table_baseline_by_persona(df)
+    tables["T4_Baseline_by_Provider"] = table_baseline_by_provider(df)
+    tables["T5_Decision_Shifts_Pooled"] = table_decision_shifts_pooled(deltas)
+    tables["T6_Decision_Shifts_by_Model"] = table_decision_shifts_by_model(deltas)
+    tables["T7_Decision_Shifts_by_Persona"] = table_decision_shifts_by_persona(deltas)
+    tables["T8_Decision_Shifts_by_Provider"] = table_decision_shifts_by_provider(deltas)
+    tables["T9_Psychologization_Rates"] = table_psychologization_rates(df, deltas)
+    tables["T10_Urgency_Direction"] = table_urgency_direction(deltas)
+    tables["T11_Composite_Deltas"] = table_composite_deltas(deltas)
+    tables["T12_Statistical_Tests"] = table_statistical_tests_master(df, deltas)
+    tables["T13_Model_Ranking"] = table_model_ranking(df)
+    tables["T14_Dimension_Ranking"] = table_dimension_ranking(deltas)
+    tables["T15_Pairwise_Comparisons"] = table_pairwise_comparisons(deltas)
 
     # Save tables to Excel
-    excel_path = output_dir / "analysis_tables.xlsx"
+    excel_path = output_dir / "Analysis_Tables.xlsx"
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        for sheet_name, table_df in tables.items():
-            table_df.to_excel(writer, sheet_name=sheet_name, index=False)
-    print(f"\nSaved tables to: {excel_path}")
+        for sheet_name, df_table in tables.items():
+            df_table.to_excel(writer, sheet_name=sheet_name, index=False)
+    print(f"✓ Analysis_Tables.xlsx ({len(tables)} sheets)")
 
     # Generate figures
-    print(f"\nGenerating figures...")
-    print(f"  fig01: Baseline Accuracy")
-    figure1_baseline_accuracy(baseline_df, output_dir)
+    print("\nGenerating figures...")
+    fig_baseline_accuracy_pooled(df, output_dir)
+    fig_baseline_by_model(df, output_dir)
+    fig_decision_change_heatmap_pooled(deltas, output_dir)
+    fig_decision_change_heatmap_by_model(deltas, output_dir)
+    fig_referral_urgency_changes(deltas, output_dir)
+    fig_psychologization_by_dimension(df, deltas, output_dir)
+    fig_urgency_direction_stacked(deltas, output_dir)
+    fig_composite_delta_diverging(deltas, output_dir)
+    fig_model_susceptibility_scatter(df, deltas, output_dir)
+    fig_model_dimension_heatmap(deltas, output_dir)
+    fig_provider_comparison(df, deltas, output_dir)
+    fig_persona_susceptibility(deltas, output_dir)
+    fig_dimension_group_comparison(deltas, output_dir)
+    fig_disease_category_dimension_interaction(df, deltas, output_dir)
+    fig_model_ranking_forest(df, output_dir)
 
-    print(f"  fig02: Decision Change Heatmap")
-    figure2_decision_change_heatmap(delta_df, output_dir)
+    # Consolidate to PDF
+    print("\nConsolidating figures to PDF...")
+    consolidate_figures_to_pdf(output_dir)
 
-    print(f"  fig03: Referral & Urgency Changes")
-    figure3_referral_urgency_changes(delta_df, output_dir)
-
-    print(f"  fig04: Psychologization Dual Panel")
-    figure4_psychologization_dual_panel(delta_df, baseline_df, output_dir)
-
-    print(f"  fig05: Urgency Direction Stacked")
-    figure5_urgency_direction_stacked(delta_df, output_dir)
-
-    print(f"  fig06: Composite Delta Diverging")
-    figure6_composite_delta_diverging(delta_df, output_dir)
-
-    print(f"  fig07: Composite by Dimension Box")
-    figure7_composite_by_dimension_box(delta_df, output_dir)
-
-    print(f"  fig08: Disease Category Heatmap")
-    figure8_disease_category_heatmap(delta_df, output_dir)
-
-    print(f"  fig09: Persona Susceptibility")
-    figure9_persona_susceptibility(delta_df, output_dir)
-
-    print(f"  fig10: Model × Persona Heatmap")
-    figure10_model_persona_heatmap(delta_df, output_dir)
-
-    print(f"  fig11: Model Shift Paired Dot")
-    figure11_model_shift_paired_dot(delta_df, output_dir)
-
-    # Consolidate PDF
-    print(f"\nConsolidating PDF...")
-    consolidate_pdf(output_dir)
-
-    # Summary
-    print(f"\n{'='*80}")
-    print(f"Analysis complete!")
-    print(f"Output directory: {output_dir}")
-    print(f"{'='*80}\n")
-
+    print("\n" + "="*70)
+    print("ANALYSIS COMPLETE")
+    print("="*70)
+    print(f"\nOutputs saved to: {output_dir}")
+    print(f"  ✓ Analysis_Tables.xlsx")
+    print(f"  ✓ 15 PNG figures (300 DPI)")
+    print(f"  ✓ consolidated_figures.pdf")
+    print("\n")
 
 if __name__ == "__main__":
     main()
